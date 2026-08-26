@@ -123,8 +123,28 @@ public class ApposeClusteringService {
         if (svc != null && svc.environment != null) {
             return Path.of(svc.environment.base());
         }
+        String customBase = qupath.ext.qpcat.preferences.QpcatPreferences.getEnvBaseDir();
+        if (customBase != null && !customBase.isBlank()) {
+            return Path.of(customBase.strip(), ENV_NAME);
+        }
         return Path.of(System.getProperty("user.home"),
                 ".local", "share", "appose", ENV_NAME);
+    }
+
+    /**
+     * The user-configured base directory for the environment, or null when the
+     * default Appose location should be used. When non-null, {@link #initialize}
+     * points Appose's builder at {@code <base>/qupath-qpcat} via
+     * {@link org.apposed.appose.Builder#base}. Kept in one place so the path
+     * reported by {@link #getEnvironmentPath()} and the path actually built stay
+     * in sync.
+     */
+    private static Path configuredEnvDir() {
+        String customBase = qupath.ext.qpcat.preferences.QpcatPreferences.getEnvBaseDir();
+        if (customBase == null || customBase.isBlank()) {
+            return null;
+        }
+        return Path.of(customBase.strip(), ENV_NAME);
     }
 
     /**
@@ -176,6 +196,18 @@ public class ApposeClusteringService {
                         .logDebug()
                         .subscribeOutput(msg -> logger.info("[pixi] {}", msg))
                         .subscribeError(msg -> logger.warn("[pixi] {}", msg));
+
+                // Honor a user-configured install location. Builder.base()
+                // overrides name(), so we pass the full <base>/qupath-qpcat dir
+                // -- matching getEnvironmentPath() (which syncManifest() already
+                // used to stage pixi.toml/pixi.lock, so the build reads them from
+                // the same place). Ensure it exists so Appose can write into it.
+                Path customEnvDir = configuredEnvDir();
+                if (customEnvDir != null) {
+                    Files.createDirectories(customEnvDir);
+                    builder.base(customEnvDir.toFile());
+                    logger.info("Using configured environment directory: {}", customEnvDir);
+                }
 
                 // Forward build progress to the status callback if provided
                 if (statusCallback != null) {

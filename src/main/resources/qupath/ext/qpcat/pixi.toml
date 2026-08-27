@@ -40,6 +40,12 @@ scanpy = ">=1.10"
 anndata = ">=0.10"
 seaborn = ">=0.13"
 squidpy = ">=1.4.0"
+# Pin the spatialdata/zarr chain to the combo the original lock resolved. A fresh
+# re-solve otherwise drifts to spatialdata 0.0.8 + zarr 3.x, and zarr 3 removed
+# zarr.storage.BaseStore, which multiscale_spatial_image (pulled by squidpy ->
+# spatialdata) imports at load time -> ImportError. zarr < 3 keeps BaseStore.
+spatialdata = ">=0.4"
+zarr = ">=2.18,<3"
 # harmonypy 2.0.0+ is a pybind11/CMake build with no Windows wheel,
 # which forces a source build that requires MSVC nmake on user machines.
 # Pin <2 to stay on the pure-Python (py3-none-any) wheel that installs

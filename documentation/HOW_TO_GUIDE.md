@@ -660,6 +660,25 @@ You can open this dialog two ways: from the menu (**Extensions > QP-CAT > Result
 The original saved result and its plots are left untouched, so you can always go back to the
 run's original labels.
 
+### Sub-clustering (cluster within a cluster)
+
+A cluster that still looks mixed -- a bimodal stacked violin, two blobs in the embedding -- can
+be split into sub-types. Select **exactly one** cluster in the list and click **Sub-cluster...**.
+The Run Clustering dialog opens, scoped to that class's cells on the current image: choose any
+algorithm, a focused marker subset (e.g. immune markers only), normalization, and embedding as
+usual, then click **Run Sub-clustering**. QP-CAT re-clusters just those cells --
+re-normalized over the subpopulation -- and assigns hierarchical classes `<name>.0`, `<name>.1`,
+... (e.g. `CD8+ T Cells.0`, `CD8+ T Cells.1`).
+
+Notes for this release:
+
+- It runs on the **current image only**, on the cells that **currently carry that class**. If
+  you loaded a saved result whose names are staged but not yet applied, click **Put this version
+  on the cells** first (or the run reports that no cells match the class).
+- Sub-cluster labels are **written straight to the cells**; the sub-run is not saved as its own
+  entry in **View Past Results** (save the project to persist the new classes). The operation is
+  recorded in the audit log.
+
 ### Renamed clusters in the Results window
 
 Reopen the copy via **View Past Results...** and every tab shows your names -- the heatmap's

@@ -211,6 +211,21 @@ try:
     pref_plot_dpi = plot_dpi
 except NameError:
     pref_plot_dpi = 150
+# PCA precursor: reduce a high-feature matrix to N principal components before
+# the embedding + clustering step (canonical scanpy flow). Driven by a per-run
+# checkbox ("Reduce features with PCA before clustering", ticked by default) sent
+# as pca_precursor_enabled; the component count comes from a preference. It only
+# engages when there is something to reduce (features > n_comps). BANKSY is always
+# exempt -- it runs its own PCA internally. Default False here so a caller that
+# omits the flag reproduces the pre-feature behaviour (full-feature clustering).
+try:
+    pref_pca_precursor_enabled = bool(pca_precursor_enabled)
+except NameError:
+    pref_pca_precursor_enabled = False
+try:
+    pref_pca_precursor_n_comps = int(pca_precursor_n_comps)
+except NameError:
+    pref_pca_precursor_n_comps = 50
 
 # Spatial stats expansion (v1) inputs
 try:
@@ -493,6 +508,71 @@ try:
 except NameError:
     embedding_mode = "auto"
 
+
+def _resolve_pca_precursor(enabled, n_features, n_comps, algorithm_name):
+    """Decide whether the PCA precursor engages, independent of sklearn.
+
+    Returns True when the reduced representation should feed embedding +
+    clustering. Driven by the per-run checkbox (`enabled`); it only actually
+    runs when there is something to reduce -- the feature count exceeds the
+    target component count `n_comps`, which keeps small panels on the full
+    matrix. BANKSY is always exempt because it runs its own PCA over
+    spatially-augmented features (pref_banksy_pca_dims), so a generic precursor
+    would corrupt that neighbourhood construction.
+    """
+    if algorithm_name == "banksy":
+        return False
+    if not enabled:
+        return False
+    if n_features <= 2:
+        return False
+    return n_features > int(n_comps)
+
+
+# ---- Optional PCA precursor -------------------------------------------------
+# Canonical scanpy reduces to N principal components first, then builds the
+# neighbor graph / UMAP / leiden on those PCs. High-dimensional configs
+# (compartment-heavy panels reach hundreds of features) both cluster faster and
+# denoise when we do the same. `cluster_matrix` is what the embedding AND the
+# clustering algorithm consume; the interpretable per-marker `adata` used for
+# rank_genes / dotplots downstream keeps the ORIGINAL features, so marker
+# rankings stay meaningful.
+cluster_matrix = df_norm.values
+pca_precursor_info = None
+_n_features = cluster_matrix.shape[1]
+if _resolve_pca_precursor(
+    pref_pca_precursor_enabled, _n_features, pref_pca_precursor_n_comps, algorithm
+):
+    from sklearn.decomposition import PCA as _PrecursorPCA
+
+    import json as _json_prec
+
+    _n_comps = int(min(pref_pca_precursor_n_comps, _n_features - 1, n_cells - 1))
+    if _n_comps >= 2:
+        _prec = _PrecursorPCA(n_components=_n_comps, random_state=embedding_seed)
+        cluster_matrix = _prec.fit_transform(df_norm.values)
+        _prec_var = float(np.sum(_prec.explained_variance_ratio_))
+        pca_precursor_info = {
+            "applied": True,
+            "n_input_features": int(_n_features),
+            "n_components": int(_n_comps),
+            "explained_variance": _prec_var,
+        }
+        task.outputs["pca_precursor"] = _json_prec.dumps(pca_precursor_info)
+        logger.info(
+            "PCA precursor: %d features -> %d PCs (%.1f%% variance retained); "
+            "feeds embedding + clustering",
+            _n_features,
+            _n_comps,
+            100.0 * _prec_var,
+        )
+    else:
+        logger.info(
+            "PCA precursor requested but only %d components available; "
+            "clustering on full features",
+            _n_comps,
+        )
+
 embedding_result = None
 if embedding_method == "umap":
     import umap
@@ -532,7 +612,7 @@ if embedding_method == "umap":
         n_components=embedding_n_components,
         **exec_kwargs
     )
-    embedding_result = reducer.fit_transform(df_norm.values)
+    embedding_result = reducer.fit_transform(cluster_matrix)
 
 elif embedding_method == "pca":
     from sklearn.decomposition import PCA
@@ -540,7 +620,7 @@ elif embedding_method == "pca":
     # The embedding output shape follows embedding_n_components (2 or 3); the
     # Java side reads the second dim from the NDArray shape and writes NAME1..K.
     pca = PCA(n_components=embedding_n_components, random_state=embedding_seed)
-    embedding_result = pca.fit_transform(df_norm.values)
+    embedding_result = pca.fit_transform(cluster_matrix)
     logger.info(
         "PCA: explained variance = %s",
         [round(v, 4) for v in pca.explained_variance_ratio_],
@@ -576,7 +656,7 @@ elif embedding_method == "tsne":
     else:
         tsne_kwargs["n_iter"] = n_iter
     tsne = TSNE(**tsne_kwargs)
-    embedding_result = tsne.fit_transform(df_norm.values)
+    embedding_result = tsne.fit_transform(cluster_matrix)
     logger.info(
         "t-SNE: perplexity=%.1f, learning_rate=%s, iterations=%d, "
         "early_exaggeration=%.1f, seed=%d",
@@ -616,7 +696,7 @@ if algorithm == "leiden":
     resolution = algorithm_params.get("resolution", 1.0)
     logger.info("Leiden: n_neighbors=%d, resolution=%.2f", n_neighbors, resolution)
 
-    adata = ad.AnnData(X=df_norm.values)
+    adata = ad.AnnData(X=cluster_matrix)
     sc.pp.neighbors(
         adata, n_neighbors=n_neighbors, use_rep="X", random_state=clustering_seed
     )
@@ -635,7 +715,7 @@ elif algorithm == "kmeans":
     n_clusters = algorithm_params.get("n_clusters", 10)
     logger.info("KMeans: n_clusters=%d", n_clusters)
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=clustering_seed)
-    labels = km.fit_predict(df_norm.values)
+    labels = km.fit_predict(cluster_matrix)
 
 elif algorithm == "hdbscan":
     from sklearn.cluster import HDBSCAN
@@ -646,7 +726,7 @@ elif algorithm == "hdbscan":
         "HDBSCAN: min_cluster_size=%d, min_samples=%d", min_cluster_size, min_samples
     )
     hdb = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples)
-    labels = hdb.fit_predict(df_norm.values)
+    labels = hdb.fit_predict(cluster_matrix)
 
 elif algorithm == "agglomerative":
     from sklearn.cluster import AgglomerativeClustering
@@ -655,7 +735,7 @@ elif algorithm == "agglomerative":
     linkage = algorithm_params.get("linkage", "ward")
     logger.info("Agglomerative: n_clusters=%d, linkage=%s", n_clusters, linkage)
     agg = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
-    labels = agg.fit_predict(df_norm.values)
+    labels = agg.fit_predict(cluster_matrix)
 
 elif algorithm == "minibatchkmeans":
     from sklearn.cluster import MiniBatchKMeans
@@ -666,7 +746,7 @@ elif algorithm == "minibatchkmeans":
     mbkm = MiniBatchKMeans(
         n_clusters=n_clusters, batch_size=batch_size, random_state=clustering_seed
     )
-    labels = mbkm.fit_predict(df_norm.values)
+    labels = mbkm.fit_predict(cluster_matrix)
 
 elif algorithm == "gmm":
     from sklearn.mixture import GaussianMixture
@@ -681,7 +761,7 @@ elif algorithm == "gmm":
         covariance_type=covariance_type,
         random_state=clustering_seed,
     )
-    labels = gmm.fit_predict(df_norm.values)
+    labels = gmm.fit_predict(cluster_matrix)
 
 elif algorithm == "banksy":
     if not has_spatial_coords:
@@ -1036,13 +1116,22 @@ adata.obs["cluster"] = pd.Categorical(
 if embedding_result is not None:
     adata.obsm["X_embed"] = embedding_result
 
+# When the PCA precursor is active, expose those PCs so the post-hoc neighbor
+# graph (PAGA + dendrogram) is built on the SAME space the clustering used,
+# matching scanpy's use_rep="X_pca" convention. adata.X stays the original
+# per-marker features so rank_genes_groups / dotplots remain interpretable.
+_analysis_rep = "X"
+if pca_precursor_info is not None and cluster_matrix.shape[0] == adata.n_obs:
+    adata.obsm["X_pca"] = cluster_matrix
+    _analysis_rep = "X_pca"
+
 # Compute neighbor graph (needed for PAGA and dendrogram)
 n_neigh = min(15, n_cells - 1)
 embedding_only = algorithm == "none"
 can_analyze = n_neigh >= 2 and n_clusters_found > 1 and not embedding_only
 
 if can_analyze:
-    sc.pp.neighbors(adata, n_neighbors=n_neigh, use_rep="X")
+    sc.pp.neighbors(adata, n_neighbors=n_neigh, use_rep=_analysis_rep)
     sc.tl.dendrogram(adata, groupby="cluster")
 
     # 6a. Marker ranking (Wilcoxon rank-sum test)
@@ -1528,11 +1617,48 @@ if do_plots and plot_dir and can_analyze:
     except NameError:
         plot_paths = {}
 
+    # Feature selection for the var-heavy plots (dotplot / matrixplot /
+    # stacked_violin). Compartment-heavy configs reach hundreds of features
+    # (e.g. 2 markers x 34 compartments = 442), which makes these plots both
+    # unreadably wide AND very slow -- stacked_violin renders a KDE per feature
+    # per cluster, so its cost is O(features x clusters). Above a threshold,
+    # restrict them to the most cluster-discriminative features: the union of
+    # the Wilcoxon top-K per cluster already ranked in 6a. Cell-count-heavy
+    # plots (embedding/spatial scatter) are handled separately via rasterize.
+    plot_var_names = list(marker_names)
+    _MAX_PLOT_VARS = 40
+    if len(plot_var_names) > _MAX_PLOT_VARS:
+        try:
+            _ranked = adata.uns["rank_genes_groups"]["names"]
+            _cats = list(adata.obs["cluster"].cat.categories)
+            _per = max(2, -(-30 // max(1, len(_cats))))  # ceil(30 / n_clusters)
+            _sel, _seen = [], set()
+            for _cid in _cats:
+                for _nm in list(_ranked[_cid])[:_per]:
+                    _nm = str(_nm)
+                    if _nm not in _seen:
+                        _seen.add(_nm)
+                        _sel.append(_nm)
+            if _sel:
+                plot_var_names = _sel
+                logger.info(
+                    "Plot features: showing %d of %d most discriminative "
+                    "(dotplot/matrixplot/violin) for speed and readability",
+                    len(plot_var_names),
+                    len(marker_names),
+                )
+        except Exception as e:
+            logger.warning(
+                "Top-feature selection for plots failed (%s); using all %d",
+                e,
+                len(marker_names),
+            )
+
     # Dotplot with dendrogram -- fraction expressing + mean expression per cluster
     try:
         dp = sc.pl.dotplot(
             adata,
-            var_names=list(marker_names),
+            var_names=plot_var_names,
             groupby="cluster",
             dendrogram=True,
             standard_scale="var",
@@ -1551,7 +1677,7 @@ if do_plots and plot_dir and can_analyze:
     try:
         mp = sc.pl.matrixplot(
             adata,
-            var_names=list(marker_names),
+            var_names=plot_var_names,
             groupby="cluster",
             dendrogram=True,
             standard_scale="var",
@@ -1582,7 +1708,7 @@ if do_plots and plot_dir and can_analyze:
         try:
             sv = sc.pl.stacked_violin(
                 adata,
-                var_names=list(marker_names),
+                var_names=plot_var_names,
                 groupby="cluster",
                 dendrogram=True,
                 show=False,
@@ -1600,7 +1726,13 @@ if do_plots and plot_dir and can_analyze:
     if embedding_result is not None:
         try:
             fig, ax = plt.subplots(figsize=(8, 6))
-            sc.pl.embedding(adata, basis="embed", color="cluster", show=False, ax=ax)
+            # rasterize the point cloud: at 40k+ cells an un-rasterized scatter
+            # embeds one vector glyph per cell, making savefig scale with cells.
+            sc.pl.embedding(
+                adata, basis="embed", color="cluster", show=False, ax=ax
+            )
+            for _coll in ax.collections:
+                _coll.set_rasterized(True)
             embed_path = os.path.join(plot_dir, "cluster_embedding.png")
             fig.savefig(embed_path, dpi=pref_plot_dpi, bbox_inches="tight")
             plt.close("all")

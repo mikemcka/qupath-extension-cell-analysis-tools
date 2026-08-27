@@ -15,8 +15,11 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -123,8 +126,28 @@ public class ApposeClusteringService {
         if (svc != null && svc.environment != null) {
             return Path.of(svc.environment.base());
         }
+        String customBase = qupath.ext.qpcat.preferences.QpcatPreferences.getEnvBaseDir();
+        if (customBase != null && !customBase.isBlank()) {
+            return Path.of(customBase.strip(), ENV_NAME);
+        }
         return Path.of(System.getProperty("user.home"),
                 ".local", "share", "appose", ENV_NAME);
+    }
+
+    /**
+     * The user-configured base directory for the environment, or null when the
+     * default Appose location should be used. When non-null, {@link #initialize}
+     * points Appose's builder at {@code <base>/qupath-qpcat} via
+     * {@link org.apposed.appose.Builder#base}. Kept in one place so the path
+     * reported by {@link #getEnvironmentPath()} and the path actually built stay
+     * in sync.
+     */
+    private static Path configuredEnvDir() {
+        String customBase = qupath.ext.qpcat.preferences.QpcatPreferences.getEnvBaseDir();
+        if (customBase == null || customBase.isBlank()) {
+            return null;
+        }
+        return Path.of(customBase.strip(), ENV_NAME);
     }
 
     /**
@@ -177,6 +200,18 @@ public class ApposeClusteringService {
                         .subscribeOutput(msg -> logger.info("[pixi] {}", msg))
                         .subscribeError(msg -> logger.warn("[pixi] {}", msg));
 
+                // Honor a user-configured install location. Builder.base()
+                // overrides name(), so we pass the full <base>/qupath-qpcat dir
+                // -- matching getEnvironmentPath() (which syncManifest() already
+                // used to stage pixi.toml/pixi.lock, so the build reads them from
+                // the same place). Ensure it exists so Appose can write into it.
+                Path customEnvDir = configuredEnvDir();
+                if (customEnvDir != null) {
+                    Files.createDirectories(customEnvDir);
+                    builder.base(customEnvDir.toFile());
+                    logger.info("Using configured environment directory: {}", customEnvDir);
+                }
+
                 // Forward build progress to the status callback if provided
                 if (statusCallback != null) {
                     builder.subscribeProgress((msg, step, numSteps) ->
@@ -186,6 +221,17 @@ public class ApposeClusteringService {
                 environment = builder.build();
 
                 logger.info("QPCAT Appose environment built");
+
+                // On Linux with an old system libstdc++ (e.g. RHEL 9), the conda-forge native
+                // libs (torch, scikit-learn, numba, ...) require a newer libstdc++ than
+                // /lib64 provides -- the env ships that newer libstdc++ in its own lib dir.
+                // Appose launches the worker python DIRECTLY (no env activation), so the env
+                // lib dir is not on the loader path and the too-old system libstdc++ wins,
+                // giving "ImportError: ... GLIBCXX_3.4.xx not found". Install a tiny shim over
+                // the env's python that prepends the env lib dir to LD_LIBRARY_PATH. No-op on
+                // non-Linux, when already installed, or if the layout is unexpected.
+                installLinuxLibraryPathShim();
+
                 report(statusCallback, "Starting Python service...");
 
                 pythonService = environment.python();
@@ -771,6 +817,72 @@ public class ApposeClusteringService {
      *       removed it), then no-op.</li>
      * </ul>
      *
+     * Install a shell shim over the env's {@code python}/{@code python3} so it prepends the
+     * env's own {@code lib} directory to {@code LD_LIBRARY_PATH} before exec'ing the real
+     * interpreter. This makes the conda-forge native libs find the env's newer libstdc++
+     * instead of the (possibly too-old) system one -- needed because Appose launches the
+     * worker python directly, without the env activation that would otherwise set this.
+     * <p>
+     * Linux-only; a no-op on other platforms, when already installed, or when the env layout
+     * is not the expected pixi {@code .pixi/envs/default/bin} shape. The real interpreter
+     * binary (e.g. {@code python3.11}) is left untouched, so pixi never sees a changed file;
+     * only the {@code python}/{@code python3} entries (which Appose looks for) are replaced.
+     */
+    private void installLinuxLibraryPathShim() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        if (!os.contains("linux") || environment == null) {
+            return;
+        }
+        try {
+            Path binDir = Path.of(environment.base())
+                    .resolve(".pixi")
+                    .resolve("envs")
+                    .resolve("default")
+                    .resolve("bin");
+            if (!Files.isDirectory(binDir)) {
+                logger.info("libstdc++ shim: env bin dir not found at {}, skipping", binDir);
+                return;
+            }
+            Path pythonLink = binDir.resolve("python");
+            // Fresh env: python is a symlink to the real interpreter (e.g. python3.11). If it
+            // is already a regular file, our shim is in place -- idempotent no-op.
+            if (!Files.isSymbolicLink(pythonLink)) {
+                return;
+            }
+            String realName = Files.readSymbolicLink(pythonLink).getFileName().toString();
+            Path realBin = binDir.resolve(realName);
+            if (!Files.exists(realBin, LinkOption.NOFOLLOW_LINKS)) {
+                logger.info("libstdc++ shim: real interpreter {} not found, skipping", realBin);
+                return;
+            }
+            // $ORIGIN-relative so the shim keeps working if the env dir is moved.
+            String script = "#!/bin/sh\n"
+                    + "here=$(cd \"$(dirname \"$0\")\" && pwd)\n"
+                    + "export LD_LIBRARY_PATH=\"$here/../lib:${LD_LIBRARY_PATH}\"\n"
+                    + "exec \"$here/" + realName + "\" \"$@\"\n";
+            Set<PosixFilePermission> perms = Set.of(
+                    PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.GROUP_READ,
+                    PosixFilePermission.GROUP_EXECUTE, PosixFilePermission.OTHERS_READ,
+                    PosixFilePermission.OTHERS_EXECUTE);
+            for (String name : new String[] {"python", "python3"}) {
+                Path entry = binDir.resolve(name);
+                if (!Files.isSymbolicLink(entry)) {
+                    continue;
+                }
+                Files.delete(entry);
+                Files.writeString(entry, script, StandardCharsets.UTF_8);
+                Files.setPosixFilePermissions(entry, perms);
+            }
+            logger.info("Installed libstdc++ LD_LIBRARY_PATH shim over env python -> {}", realName);
+        } catch (Exception e) {
+            // Non-fatal: on a system with a new-enough libstdc++ the worker imports fine
+            // without the shim; log and continue.
+            logger.warn("Could not install libstdc++ LD_LIBRARY_PATH shim: {}", e.getMessage());
+        }
+    }
+
+    /**
      * @return true if the environment was wiped for a rebuild
      */
     private boolean syncManifest(String expectedToml, String expectedLock) {

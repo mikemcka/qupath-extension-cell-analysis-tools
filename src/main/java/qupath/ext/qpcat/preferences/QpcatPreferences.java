@@ -305,6 +305,16 @@ public final class QpcatPreferences {
     private static final IntegerProperty shutdownTimeoutMs = PathPrefs.createPersistentPreference(
             "qpcat.service.shutdownTimeoutMs", 5000);
 
+    // Base directory under which the Appose/pixi Python environment is created.
+    // Empty (default) means the standard Appose location under the user home
+    // ({user.home}/.local/share/appose). The environment itself always lands in
+    // a "qupath-qpcat" subfolder of this base. This exists because some systems
+    // (HPC/managed desktops) give the home directory a small quota that cannot
+    // hold the ~2.5 GB environment -- pointing this at a larger scratch volume
+    // lets those users build it at all. See ApposeClusteringService.
+    private static final StringProperty envBaseDir = PathPrefs.createPersistentPreference(
+            "qpcat.env.baseDir", "");
+
     // ==================== Getters / Setters ====================
 
     public static int getAeLatentDim() { return aeLatentDim.get(); }
@@ -537,6 +547,13 @@ public final class QpcatPreferences {
     public static int getTaskMaxRetries() { return taskMaxRetries.get(); }
     public static int getTaskRetrySleepMs() { return taskRetrySleepMs.get(); }
     public static int getShutdownTimeoutMs() { return shutdownTimeoutMs.get(); }
+
+    /**
+     * Base directory under which the Python environment is created, or an empty
+     * string to use the default Appose location under the user home.
+     */
+    public static String getEnvBaseDir() { return envBaseDir.get(); }
+    public static void setEnvBaseDir(String v) { envBaseDir.set(v == null ? "" : v.strip()); }
 
     // ==================== Preferences Pane ====================
 
@@ -930,6 +947,18 @@ public final class QpcatPreferences {
                 .category(CATEGORY_GENERAL)
                 .description(Tooltips.wrap("Milliseconds to wait for Python service shutdown (default: 5000). "
                         + "Increase if Python tasks take longer to stop gracefully."))
+                .build());
+
+        items.add(new PropertyItemBuilder<>(envBaseDir, String.class)
+                .name("Environment Base Directory")
+                .category(CATEGORY_GENERAL)
+                .description(Tooltips.wrap("Directory under which the Python environment is installed "
+                        + "(the environment lands in a 'qupath-qpcat' subfolder). Leave empty to use "
+                        + "the default location under your home directory "
+                        + "(~/.local/share/appose). Set this to a larger volume (e.g. a scratch "
+                        + "disk) if your home directory has a small disk quota -- the environment "
+                        + "needs ~2.5 GB. Changing this after the environment is built triggers a "
+                        + "rebuild at the new location; the old one is not deleted automatically."))
                 .build());
 
         items.add(new PropertyItemBuilder<>(acknowledgedBackupWarning, Boolean.class)

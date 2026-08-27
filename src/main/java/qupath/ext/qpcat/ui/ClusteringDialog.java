@@ -133,6 +133,7 @@ public class ClusteringDialog {
     private CheckBox spatialAnalysisCheck;
     private CheckBox spatialSmoothingCheck;
     private Spinner<Integer> smoothingIterationsSpinner;
+    private CheckBox pcaPrecursorCheck;
     private CheckBox batchCorrectionCheck;
     private ComboBox<String> batchKeyCombo;
 
@@ -736,6 +737,17 @@ public class ClusteringDialog {
                 tipLabel("Iterations:", smoothingIterationsSpinner), smoothingIterationsSpinner);
         smoothingRow.setAlignment(Pos.CENTER_LEFT);
 
+        pcaPrecursorCheck = new CheckBox("Reduce features with PCA before clustering");
+        pcaPrecursorCheck.setSelected(true);
+        pcaPrecursorCheck.setTooltip(Tooltips.of(
+                "Reduce a high-feature matrix to principal components before the\n"
+                + "embedding and clustering step (the canonical scanpy flow):\n"
+                + "faster and less noisy on panels with many markers/compartments.\n"
+                + "Only engages when there is something to reduce (feature count\n"
+                + "above the component count); small panels are untouched, and\n"
+                + "BANKSY always runs its own PCA and is unaffected.\n"
+                + "The component count is set in QP-CAT preferences (default 50)."));
+
         batchCorrectionCheck = new CheckBox("Batch correction (Harmony) - for multi-image clustering");
         batchCorrectionCheck.setSelected(false);
         batchCorrectionCheck.setDisable(true);
@@ -822,7 +834,7 @@ public class ClusteringDialog {
         refreshBatchGate.run();
 
         VBox box = new VBox(5, generatePlotsCheck, spatialAnalysisCheck,
-                smoothingRow, batchCorrectionCheck, batchKeyRow,
+                smoothingRow, pcaPrecursorCheck, batchCorrectionCheck, batchKeyRow,
                 areasPane, spatialStatsPane);
         return box;
     }
@@ -1866,6 +1878,7 @@ public class ClusteringDialog {
         config.setEnableSpatialAnalysis(spatialAnalysisCheck.isSelected());
         config.setEnableSpatialSmoothing(spatialSmoothingCheck.isSelected());
         config.setSpatialSmoothingIterations(smoothingIterationsSpinner.getValue());
+        config.setPcaPrecursor(pcaPrecursorCheck.isSelected());
         config.setEnableBatchCorrection(batchCorrectionCheck.isSelected());
         config.setAreaLevels(areasSection.getAreaLevels());
         config.setBatchKey(BATCH_KEY_AREAS_LABEL.equals(batchKeyCombo.getValue())
@@ -2210,6 +2223,7 @@ public class ClusteringDialog {
         spatialAnalysisCheck.setSelected(config.isEnableSpatialAnalysis());
         spatialSmoothingCheck.setSelected(config.isEnableSpatialSmoothing());
         smoothingIterationsSpinner.getValueFactory().setValue(config.getSpatialSmoothingIterations());
+        pcaPrecursorCheck.setSelected(config.isPcaPrecursor());
         batchCorrectionCheck.setSelected(config.isEnableBatchCorrection());
         areasSection.setAreaLevels(config.getAreaLevels());
         batchKeyCombo.setValue(

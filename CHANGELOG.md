@@ -6,6 +6,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); QP-
 
 ## [Unreleased]
 
+### Added
+
+- **PCA precursor for high-feature configs.** A new **"Reduce features with PCA before
+  clustering"** checkbox in the Run Clustering dialog (**ticked by default**) reduces a
+  high-feature matrix to principal components before the embedding + clustering step --
+  the canonical scanpy flow (`sc.pp.pca` -> `sc.pp.neighbors(use_rep="X_pca")` ->
+  leiden/UMAP). Compartment-heavy panels (e.g. 2 markers x 34 compartments = 442 features)
+  cluster faster and denoise. The reduced representation feeds BOTH the embedding and every
+  clustering algorithm; the per-marker AnnData used for `rank_genes_groups` / dotplots keeps
+  the original features, so marker rankings stay interpretable, and the post-hoc
+  PAGA/dendrogram neighbor graph is built on the PCs to match the clustering space. It only
+  engages when there is something to reduce -- the feature count exceeds the component count
+  (a **PCA Precursor Components** preference, default 50, which also acts as the engage
+  floor) -- so small panels are untouched. BANKSY is always exempt (it runs its own PCA over
+  spatially-augmented features). When engaged, the run records "N features -> K PCs (V%
+  variance retained)" in the operation audit log for reproducibility, since the precursor
+  changes cluster labels. The checkbox state is saved into the run config; **reloading a
+  config saved before this release enables the precursor by default -- untick it to
+  reproduce the original clusters exactly.**
+
+### Fixed
+
+- **Plot generation stalled on high-feature runs.** With hundreds of features the static
+  scanpy figures dominated wall-clock: the dotplot / matrix plot / stacked violin each
+  rendered one column PER feature (a ~442-column canvas), and `stacked_violin` computed a
+  KDE per feature per cluster. These plots now restrict to the most cluster-discriminative
+  features (the union of the Wilcoxon top-K per cluster, already ranked for the results
+  panel) whenever the feature count exceeds 40 -- both far faster and actually readable;
+  small panels are unchanged. The cluster-embedding scatter also rasterizes its point
+  cloud, so `savefig` no longer scales with cell count (matching the spatial scatter).
+
 ## [0.11.0] -- 2026-08-22 -- trustworthy results for TMA cores and subregions
 
 ### Fixed

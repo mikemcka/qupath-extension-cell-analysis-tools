@@ -2,10 +2,6 @@
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
 
-# CUDA hint -- harmless on macOS (ignored by the resolver)
-[system-requirements]
-cuda = "12"
-
 [dependencies]
 python = "3.11.*"
 # setuptools provides pkg_resources, which xarray_schema (transitive dep of
@@ -29,19 +25,15 @@ matplotlib-base = ">=3.7"
 h5py = ">=3.0"
 # pyproj via conda-forge (includes PROJ C library; pip build fails on macOS)
 pyproj = ">=3.6"
-# PyTorch + torchvision via conda-forge for GPU support
-# Required for foundation model feature extraction and zero-shot phenotyping
-pytorch = ">=2.0.0"
-torchvision = ">=0.15.0"
+# PyTorch + torchvision via conda-forge, pinned to the CPU build. QP-CAT is
+# CPU-only (see README), and requiring a CUDA build made setup fail on
+# machines without an NVIDIA GPU: pixi validates the __cuda virtual package
+# on EVERY `pixi install` (i.e. every QuPath launch), not just at solve time,
+# so a GPU-pinned env cannot even start on a CPU-only host. build="cpu*"
+# selects the CPU variant on every platform and keeps the lock deterministic.
+pytorch = { version = ">=2.0.0", build = "cpu*" }
+torchvision = { version = ">=0.15.0", build = "cpu*" }
 pillow = ">=10.0"
-
-# CUDA steering -- pytorch-gpu steers the resolver to CUDA variants.
-# Only exists for linux-64 and win-64 (harmless to list; ignored on macOS).
-[target.linux-64.dependencies]
-pytorch-gpu = ">=2.0.0"
-
-[target.win-64.dependencies]
-pytorch-gpu = ">=2.0.0"
 
 [pypi-dependencies]
 scanpy = ">=1.10"

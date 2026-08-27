@@ -173,6 +173,13 @@ public final class QpcatPreferences {
     private static final IntegerProperty clusterPlotDpi = PathPrefs.createPersistentPreference(
             "qpcat.cluster.plotDpi", 150);
 
+    // PCA precursor component count: how many principal components the precursor
+    // keeps when the "Reduce features with PCA before clustering" checkbox is
+    // ticked in the Run Clustering dialog. Doubles as the effective engage floor --
+    // the precursor only runs when the feature count exceeds this value.
+    private static final IntegerProperty clusterPcaPrecursorComponents = PathPrefs.createPersistentPreference(
+            "qpcat.cluster.pcaPrecursorComponents", 50);
+
     // When on, editing a cluster color in the Results dialog automatically
     // regenerates the static matplotlib PNGs (embedding / spatial scatter, etc.)
     // so they match the new colors. Default off: the interactive Java plots
@@ -450,6 +457,7 @@ public final class QpcatPreferences {
     public static int getClusterMiniBatchSize() { return clusterMiniBatchSize.get(); }
     public static int getClusterBanksyPcaDims() { return clusterBanksyPcaDims.get(); }
     public static int getClusterPlotDpi() { return clusterPlotDpi.get(); }
+    public static int getClusterPcaPrecursorComponents() { return clusterPcaPrecursorComponents.get(); }
     public static boolean isClusterAutoRegeneratePlots() { return clusterAutoRegeneratePlots.get(); }
     public static void setClusterAutoRegeneratePlots(boolean v) { clusterAutoRegeneratePlots.set(v); }
 
@@ -685,6 +693,16 @@ public final class QpcatPreferences {
                 .category(CATEGORY_CLUSTERING)
                 .description(Tooltips.wrap("Resolution for saved clustering plots in DPI (default: 150). "
                         + "Higher = larger files but sharper images. Range: 72-300."))
+                .build());
+
+        items.add(new PropertyItemBuilder<>(clusterPcaPrecursorComponents, Integer.class)
+                .name("PCA Precursor Components")
+                .category(CATEGORY_CLUSTERING)
+                .description(Tooltips.wrap("Number of principal components kept by the 'Reduce features with PCA "
+                        + "before clustering' option in the Run Clustering dialog (default: 50). Also the "
+                        + "engage floor: the precursor only runs when the feature count exceeds this value. "
+                        + "Clamped to fewer than the feature and cell counts. More components retain more "
+                        + "variance but reduce the speed-up."))
                 .build());
 
         items.add(new PropertyItemBuilder<>(clusterAutoRegeneratePlots, Boolean.class)

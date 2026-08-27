@@ -681,6 +681,11 @@ public final class YamlBatchOrchestrator {
         if (cc.getSpatialSmoothing() != null) {
             config.setEnableSpatialSmoothing(cc.getSpatialSmoothing());
         }
+        // Omitted -> keep the config default (on), matching the dialog's ticked
+        // checkbox; set false in the YAML to cluster on the full feature matrix.
+        if (cc.getPcaPrecursor() != null) {
+            config.setPcaPrecursor(cc.getPcaPrecursor());
+        }
         if (cc.getBatchCorrection() != null) {
             config.setEnableBatchCorrection(cc.getBatchCorrection());
         }

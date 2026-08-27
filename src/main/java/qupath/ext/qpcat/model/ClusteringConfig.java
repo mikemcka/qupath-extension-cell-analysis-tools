@@ -93,6 +93,17 @@ public class ClusteringConfig {
     private int spatialSmoothingIterations = 1;
 
     /**
+     * Reduce a high-feature matrix to principal components before the embedding +
+     * clustering step (the canonical scanpy flow). Ticked by default. It only
+     * actually engages when there is something to reduce -- the feature count
+     * exceeds the configured component count (see the PCA Precursor Components
+     * preference) -- so small panels are untouched, and BANKSY is always exempt
+     * (it runs its own PCA over spatially-augmented features). It changes cluster
+     * labels, so the run records what it did in the operation audit log.
+     */
+    private boolean pcaPrecursor = true;
+
+    /**
      * Reproducibility-vs-speed policy for the UMAP embedding: {@code "auto"},
      * {@code "reproducible"} or {@code "fast"}.
      * <p>
@@ -273,6 +284,9 @@ public class ClusteringConfig {
 
     public int getSpatialSmoothingIterations() { return spatialSmoothingIterations; }
     public void setSpatialSmoothingIterations(int v) { this.spatialSmoothingIterations = v; }
+
+    public boolean isPcaPrecursor() { return pcaPrecursor; }
+    public void setPcaPrecursor(boolean v) { this.pcaPrecursor = v; }
 
     // ---- Spatial stats expansion (v1) accessors ----
 

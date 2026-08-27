@@ -407,6 +407,10 @@ public class ClusteringWorkflow {
         if (result.getEmbeddingExecution() != null) {
             auditParams.put("Embedding execution", result.getEmbeddingExecution());
         }
+        // The PCA precursor changes cluster labels, so it belongs in the audit trail.
+        if (result.getPcaPrecursor() != null) {
+            auditParams.put("PCA precursor", result.getPcaPrecursor());
+        }
         OperationLogger.getInstance().logOperation(opType, auditParams, completeMsg, elapsed);
 
         // Auto-save so the result is always reloadable via "View Past Results",
@@ -1820,6 +1824,8 @@ public class ClusteringWorkflow {
         inputs.put("minibatch_kmeans_batch_size", QpcatPreferences.getClusterMiniBatchSize());
         inputs.put("banksy_pca_dims_default", QpcatPreferences.getClusterBanksyPcaDims());
         inputs.put("plot_dpi", QpcatPreferences.getClusterPlotDpi());
+        inputs.put("pca_precursor_enabled", config.isPcaPrecursor());
+        inputs.put("pca_precursor_n_comps", QpcatPreferences.getClusterPcaPrecursorComponents());
 
         // ---- Spatial stats expansion (v1) inputs ----
         // Always pass; the Python side gates the heavy work on per-statistic flags.
@@ -2174,6 +2180,25 @@ public class ClusteringWorkflow {
             if (execNote != null) {
                 result.setEmbeddingExecution(String.valueOf(execNote));
                 logger.info("Embedding execution: {}", execNote);
+            }
+
+            // Whether the PCA precursor engaged (high-feature configs). It changes
+            // cluster labels, so record a readable summary for the audit trail.
+            Object precNote = task.outputs.get("pca_precursor");
+            if (precNote != null) {
+                try {
+                    Map<?, ?> m = new Gson().fromJson(String.valueOf(precNote), Map.class);
+                    int inFeat = ((Number) m.get("n_input_features")).intValue();
+                    int nComp = ((Number) m.get("n_components")).intValue();
+                    double var = ((Number) m.get("explained_variance")).doubleValue();
+                    String summary = String.format(
+                            "%d features -> %d PCs (%.1f%% variance retained)",
+                            inFeat, nComp, 100.0 * var);
+                    result.setPcaPrecursor(summary);
+                    logger.info("PCA precursor: {}", summary);
+                } catch (RuntimeException e) {
+                    logger.warn("Could not parse pca_precursor output: {}", precNote, e);
+                }
             }
 
             // ---- Spatial graph overlay (v0.3) outputs ----

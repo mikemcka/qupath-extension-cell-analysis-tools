@@ -32,6 +32,7 @@ import qupath.ext.qpcat.service.ClusterPalette;
 import qupath.ext.qpcat.service.PlotRegenerator;
 import qupath.ext.qpcat.service.ResultApplier;
 import qupath.ext.qpcat.service.ClusteringResultManager;
+import qupath.ext.qpcat.service.FilenameSanitizer;
 import qupath.ext.qpcat.preferences.QpcatPreferences;
 import qupath.ext.qpcat.service.MeasurementExtractor;
 import qupath.ext.qpcat.service.OperationLogger;
@@ -3313,9 +3314,19 @@ public class ClusteringDialog {
         openFolderBtn.setDisable(resultsFolder == null);
         openFolderBtn.setOnAction(e -> openFolder(resultsFolder));
 
+        // "Save plot": whatever tab is on top, exactly as shown -- one button
+        // instead of a bespoke export per tab, since the tabs mix live JavaFX
+        // views (heatmap, fingerprints, embedding scatter, 3D view) with
+        // static PNGs already on disk (dotplot, matrix plot, PAGA, violin).
+        // A snapshot covers both uniformly.
+        Button savePlotBtn = new Button("Save plot...");
+        savePlotBtn.setTooltip(Tooltips.of(
+                "Save the plot in the current tab as a PNG, exactly as displayed."));
+        savePlotBtn.setOnAction(e -> savePlotSnapshot(tabPane, stage));
+
         Button closeResultsBtn = new Button("Close");
         closeResultsBtn.setOnAction(e -> stage.close());
-        buttonBar.getChildren().addAll(openFolderBtn, saveBtn, manageBtn, closeResultsBtn);
+        buttonBar.getChildren().addAll(openFolderBtn, saveBtn, manageBtn, savePlotBtn, closeResultsBtn);
 
         // Disable save/manage if no project
         if (qp == null || qp.getProject() == null) {
@@ -3695,6 +3706,50 @@ public class ClusteringDialog {
         h.setBorder(null);
         // Never ellipsize a link the user is meant to find and click.
         h.setMinWidth(Region.USE_PREF_SIZE);
+    }
+
+    /**
+     * The plot content of a tab, with the {@link #wrapWithGuide} banner
+     * stripped off. Every tab's content is either the {@code VBox(bar,
+     * content)} that method returns (bar is always a {@code BorderPane}), or
+     * -- for the handful of tabs that skip it (3D View, the empty-result
+     * Summary placeholder) -- the tab's content node itself.
+     */
+    private static javafx.scene.Node plotContentOf(Tab tab) {
+        javafx.scene.Node content = tab.getContent();
+        if (content instanceof VBox vbox && vbox.getChildren().size() >= 2
+                && vbox.getChildren().get(0) instanceof BorderPane) {
+            return vbox.getChildren().get(1);
+        }
+        return content;
+    }
+
+    /**
+     * Save whichever tab is currently selected as a PNG, exactly as
+     * displayed -- one snapshot mechanism for every tab, rather than a
+     * bespoke exporter per plot type.
+     */
+    private static void savePlotSnapshot(TabPane tabPane, Stage stage) {
+        Tab tab = tabPane.getSelectionModel().getSelectedItem();
+        if (tab == null) return;
+        javafx.scene.Node target = plotContentOf(tab);
+
+        javafx.stage.FileChooser chooser = new javafx.stage.FileChooser();
+        chooser.setTitle("Save plot as PNG");
+        chooser.getExtensionFilters().add(
+                new javafx.stage.FileChooser.ExtensionFilter("PNG image", "*.png"));
+        chooser.setInitialFileName(FilenameSanitizer.sanitize(tab.getText()) + ".png");
+        File file = chooser.showSaveDialog(stage);
+        if (file == null) return;
+
+        try {
+            javafx.scene.image.WritableImage image = target.snapshot(null, null);
+            BufferedImage buffered = javafx.embed.swing.SwingFXUtils.fromFXImage(image, null);
+            javax.imageio.ImageIO.write(buffered, "png", file);
+            Dialogs.showInfoNotification("QPCAT", "Wrote " + file.getName());
+        } catch (Exception e) {
+            Dialogs.showErrorNotification("QPCAT", "Could not write PNG: " + e.getMessage());
+        }
     }
 
     /** "Compare expression views" hyperlink shared by Heatmap, Dotplot,

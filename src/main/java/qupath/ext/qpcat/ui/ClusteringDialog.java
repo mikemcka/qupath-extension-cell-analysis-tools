@@ -3322,7 +3322,7 @@ public class ClusteringDialog {
         Button savePlotBtn = new Button("Save plot...");
         savePlotBtn.setTooltip(Tooltips.of(
                 "Save the plot in the current tab as a PNG, exactly as displayed."));
-        savePlotBtn.setOnAction(e -> savePlotSnapshot(tabPane, stage));
+        savePlotBtn.setOnAction(e -> savePlotSnapshot(tabPane, stage, resultsFolder));
 
         Button closeResultsBtn = new Button("Close");
         closeResultsBtn.setOnAction(e -> stage.close());
@@ -3748,7 +3748,7 @@ public class ClusteringDialog {
      * displayed -- one snapshot mechanism for every tab, rather than a
      * bespoke exporter per plot type.
      */
-    private static void savePlotSnapshot(TabPane tabPane, Stage stage) {
+    private static void savePlotSnapshot(TabPane tabPane, Stage stage, File resultsFolder) {
         Tab tab = tabPane.getSelectionModel().getSelectedItem();
         if (tab == null) return;
         javafx.scene.Node target = plotContentOf(tab);
@@ -3758,6 +3758,11 @@ public class ClusteringDialog {
         chooser.getExtensionFilters().add(
                 new javafx.stage.FileChooser.ExtensionFilter("PNG image", "*.png"));
         chooser.setInitialFileName(FilenameSanitizer.sanitize(tab.getText()) + ".png");
+        // Default to this result's own folder (its plots already live there)
+        // rather than the OS default of the user's home directory.
+        if (resultsFolder != null && resultsFolder.isDirectory()) {
+            chooser.setInitialDirectory(resultsFolder);
+        }
         File file = chooser.showSaveDialog(stage);
         if (file == null) return;
 

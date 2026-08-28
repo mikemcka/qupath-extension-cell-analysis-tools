@@ -3714,14 +3714,33 @@ public class ClusteringDialog {
      * content)} that method returns (bar is always a {@code BorderPane}), or
      * -- for the handful of tabs that skip it (3D View, the empty-result
      * Summary placeholder) -- the tab's content node itself.
+     * <p>
+     * If a {@code ScrollPane} sits anywhere in that content (Heatmap wraps
+     * one directly; Marker Fingerprints, Representative cells etc. bury one
+     * inside their own layout, under a header), its {@code getContent()} is
+     * returned instead -- snapshotting the ScrollPane itself only captures
+     * the current viewport, cutting off anything scrolled out of view.
      */
     private static javafx.scene.Node plotContentOf(Tab tab) {
         javafx.scene.Node content = tab.getContent();
         if (content instanceof VBox vbox && vbox.getChildren().size() >= 2
                 && vbox.getChildren().get(0) instanceof BorderPane) {
-            return vbox.getChildren().get(1);
+            content = vbox.getChildren().get(1);
         }
-        return content;
+        ScrollPane scroll = findScrollPane(content);
+        return (scroll != null && scroll.getContent() != null) ? scroll.getContent() : content;
+    }
+
+    /** First {@code ScrollPane} found in this node's subtree (depth-first), or null. */
+    private static ScrollPane findScrollPane(javafx.scene.Node node) {
+        if (node instanceof ScrollPane sp) return sp;
+        if (node instanceof javafx.scene.Parent parent) {
+            for (javafx.scene.Node child : parent.getChildrenUnmodifiable()) {
+                ScrollPane found = findScrollPane(child);
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     /**

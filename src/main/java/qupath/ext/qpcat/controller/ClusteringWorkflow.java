@@ -2269,9 +2269,35 @@ public class ClusteringWorkflow {
     }
 
     /**
+     * Builds the label -&gt; display-name map for a sub-cluster run, mirroring the
+     * exact naming {@link ResultApplier#applySubclusterLabels} writes onto the
+     * detections' PathClass ({@code parentClusterName + "." + label}). Covers
+     * EVERY distinct label the run produced, including negative (noise) labels --
+     * {@code applySubclusterLabels} does not special-case those into "Noise
+     * (unclustered)" the way the top-level {@code applyClusterLabels} does, it
+     * names them {@code <parent>.-1} like any other label, so the saved result's
+     * default names must match that or "Manage Clusters" / the results dialog
+     * would show a name nothing on the cells actually carries.
+     * <p>
+     * Setting this on {@link ClusteringResult#setClusterNames} reuses the same
+     * rename/merge machinery the results dialog and auto-save already have
+     * ({@code result.clusterName(int)} / {@code SavedClusteringResult.fromResult}
+     * both consult this map first) -- no schema change needed.
+     */
+    private Map<Integer, String> buildSubclusterNames(int[] labels, String parentClusterName) {
+        Map<Integer, String> names = new LinkedHashMap<>();
+        for (int lab : labels) {
+            names.putIfAbsent(lab, parentClusterName + "." + lab);
+        }
+        return names;
+    }
+
+    /**
      * Runs sub-clustering on detections within a specific parent cluster.
      * The parent cluster detections are re-clustered and assigned hierarchical labels
-     * (e.g., "Cluster 3.0", "Cluster 3.1").
+     * (e.g., "Cluster 3.0", "Cluster 3.1"). The result is auto-saved (same as
+     * {@link #runClustering}) so it can be renamed/merged via "Manage Clusters"
+     * and reopened via "View Past Results".
      *
      * @param parentClusterName  the parent cluster classification (e.g., "Cluster 3")
      * @param config             clustering configuration to use for sub-clustering
@@ -2327,6 +2353,25 @@ public class ClusteringWorkflow {
             throw new IOException("Sub-clustering failed: " + e.getMessage(), e);
         }
 
+        // Per-cell back-references for plot-click navigation + representative crops,
+        // same as runClustering: single-image run, so segments carry no entry --
+        // supply the open image's id (looked up from the project) + name as the
+        // fallback for every cell.
+        String fbName = imageData.getServer().getMetadata().getName();
+        String fbId = null;
+        var projectForRefs = currentProject();
+        if (projectForRefs != null) {
+            var openEntry = projectForRefs.getEntry(imageData);
+            if (openEntry != null) fbId = openEntry.getID();
+        }
+        result.setCellRefs(buildCellRefs(extraction, fbId, fbName));
+        result.setCellParentNames(buildParentNames(extraction));
+        result.setCellParentClasses(buildParentClassNames(extraction));
+        // Default display names must match what applySubclusterLabels actually
+        // writes onto the cells ("<parent>.<label>"), not the generic "Cluster N"
+        // autoSaveResult/the results dialog would otherwise fall back to.
+        result.setClusterNames(buildSubclusterNames(result.getClusterLabels(), parentClusterName));
+
         // Apply hierarchical sub-cluster labels
         report(progressCallback, "Applying sub-cluster labels...");
         ResultApplier applier = new ResultApplier();
@@ -2360,7 +2405,218 @@ public class ClusteringWorkflow {
                         extraction.getNCells()),
                 completeMsg, elapsed);
 
+        // Auto-save so the sub-cluster result is reloadable via "View Past Results"
+        // and manageable (rename/merge) via "Manage Clusters" -- same treatment
+        // runClustering gives a normal single-image run. Scope key reuses the
+        // open image's id/name, same bucket a normal run on this image would use;
+        // the scope LABEL calls out that this is a sub-cluster so it reads
+        // distinctly from a normal run in the saved-result dropdown.
+        String scopeKey = (fbId != null) ? fbId : fbName;
+        String scopeLabel = fbName + " (sub-cluster of '" + parentClusterName + "')";
+        autoSaveResult(result, config, scopeKey, scopeLabel);
+
         return result;
+    }
+
+    /**
+     * Runs sub-clustering on detections within a specific parent cluster across
+     * multiple project images. Every {@code imageEntries} image is searched for
+     * cells already classified as {@code parentClusterName}; those cells are
+     * pooled, re-clustered TOGETHER in one run, and assigned hierarchical labels
+     * (e.g. "Macrophage.0", "Macrophage.1") back on their own image. Images with
+     * no matching cells are skipped -- most images will not carry every class.
+     * <p>
+     * Mirrors {@link #runProjectClustering} for the multi-image plumbing (load,
+     * extract, one Appose call, apply + save per image) AND for auto-saving the
+     * result (so it is reloadable via "View Past Results" and manageable via
+     * "Manage Clusters", same as {@link #runSubclustering} now does for the
+     * single-image case). Still stays on the simpler no-spatial-graph-overlay
+     * path {@link #runSubclustering} uses -- that piece remains out of scope.
+     *
+     * @param parentClusterName the parent cluster classification (e.g., "Macrophage")
+     * @param imageEntries      project images to search for cells of that classification
+     * @param config            clustering configuration to use for sub-clustering
+     * @param progressCallback  optional callback for progress messages
+     * @return the clustering result for the pooled sub-cluster run
+     * @throws IOException if sub-clustering fails, or no image has any matching cell
+     */
+    public ClusteringResult runProjectSubclustering(
+            String parentClusterName,
+            List<ProjectImageEntry<BufferedImage>> imageEntries,
+            ClusteringConfig config,
+            Consumer<String> progressCallback) throws IOException {
+
+        long startTime = System.currentTimeMillis();
+
+        if (imageEntries == null || imageEntries.isEmpty()) {
+            throw new IOException("No project images selected for sub-clustering.");
+        }
+
+        reportPhase(progressCallback, "load", "Loading '" + parentClusterName
+                + "' detections from " + imageEntries.size() + " images...");
+
+        // Build per-image detection groups, filtered to cells already classified
+        // as parentClusterName -- same predicate runSubclustering uses, applied
+        // per image instead of DetectionSelector.filterToCellsWhenPresent.
+        List<MeasurementExtractor.ImageDetectionGroup> groups = new ArrayList<>();
+        for (int idx = 0; idx < imageEntries.size(); idx++) {
+            ProjectImageEntry<BufferedImage> entry = imageEntries.get(idx);
+            report(progressCallback, "Loading image " + (idx + 1) + "/" + imageEntries.size()
+                    + ": " + entry.getImageName());
+
+            ImageData<BufferedImage> imageData;
+            try {
+                imageData = entry.readImageData();
+            } catch (Exception e) {
+                logger.warn("Failed to read image data for {}: {}", entry.getImageName(), e.getMessage());
+                continue;
+            }
+
+            List<PathObject> parentDetections = imageData.getHierarchy().getDetectionObjects()
+                    .stream()
+                    .filter(det -> {
+                        var pc = det.getPathClass();
+                        return pc != null && pc.toString().equals(parentClusterName);
+                    })
+                    .collect(Collectors.toList());
+
+            if (parentDetections.isEmpty()) {
+                logger.info("Skipping {} - no detections classified as '{}'",
+                        entry.getImageName(), parentClusterName);
+                continue;
+            }
+
+            groups.add(new MeasurementExtractor.ImageDetectionGroup(
+                    entry, imageData, parentDetections));
+            logger.info("Loaded {} '{}' detections from {}",
+                    parentDetections.size(), parentClusterName, entry.getImageName());
+        }
+
+        if (groups.isEmpty()) {
+            throw new IOException("No detections found with classification '"
+                    + parentClusterName + "' in any selected image.");
+        }
+        try {
+
+        // Extract measurements across every matching cell
+        reportPhase(progressCallback, "extract", "Extracting measurements...");
+        MeasurementExtractor extractor = new MeasurementExtractor();
+        MeasurementExtractor.ExtractionResult extraction =
+                extractor.extractMultiImage(groups, config.getSelectedMeasurements());
+
+        logger.info("Combined extraction: {} cells x {} measurements across {} images",
+                extraction.getNCells(), extraction.getNMeasurements(),
+                extraction.getImageSegments().size());
+
+        warnDroppedMeasurements(extraction);
+
+        int nImages = extraction.getImageSegments().size();
+        report(progressCallback, "Sub-clustering " + extraction.getNCells()
+                + " cells from " + parentClusterName + " across " + nImages + " images...");
+
+        // Run clustering via Appose -- one call for the pooled cells
+        ClusteringResult result;
+        try {
+            result = ApposeClusteringService.withExtensionClassLoader(() ->
+                    executeClusteringTask(extraction, config, progressCallback));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("Sub-clustering failed: " + e.getMessage(), e);
+        }
+
+        // Per-cell back-references: multi-image segments each carry their own
+        // ProjectImageEntry, so no fallback id/name is needed (mirrors
+        // runProjectClustering).
+        result.setCellRefs(buildCellRefs(extraction, null, null));
+        result.setCellParentNames(buildParentNames(extraction));
+        result.setCellParentClasses(buildParentClassNames(extraction));
+        // Default display names must match what applySubclusterLabels actually
+        // writes onto each cell ("<parent>.<label>"), not the generic "Cluster N"
+        // autoSaveResult/the results dialog would otherwise fall back to.
+        result.setClusterNames(buildSubclusterNames(result.getClusterLabels(), parentClusterName));
+
+        // Apply hierarchical sub-cluster labels + embedding back per-image, then
+        // save. No spatial-graph overlay handling here, matching runSubclustering.
+        reportPhase(progressCallback, "apply", "Applying results to project images...");
+        ResultApplier applier = new ResultApplier();
+
+        for (MeasurementExtractor.ImageSegment segment : extraction.getImageSegments()) {
+            int start = segment.getStartIndex();
+            int end = segment.getEndIndex();
+
+            List<PathObject> segmentDetections = extraction.getDetections().subList(start, end);
+            int[] segmentLabels = new int[end - start];
+            System.arraycopy(result.getClusterLabels(), start, segmentLabels, 0, end - start);
+
+            applier.applySubclusterLabels(segmentDetections, segmentLabels, parentClusterName);
+
+            if (result.hasEmbedding()) {
+                String prefix = ResultApplier.getEmbeddingPrefix(
+                        config.getEmbeddingMethod().getId(), embeddingName(config));
+                double[][] segmentEmbedding = new double[end - start][2];
+                for (int i = 0; i < end - start; i++) {
+                    segmentEmbedding[i] = result.getEmbedding()[start + i];
+                }
+                applier.applyEmbedding(segmentDetections, segmentEmbedding, prefix);
+            }
+
+            @SuppressWarnings("unchecked")
+            ProjectImageEntry<BufferedImage> entry =
+                    (ProjectImageEntry<BufferedImage>) segment.getImageEntry();
+            @SuppressWarnings("unchecked")
+            ImageData<BufferedImage> imageData =
+                    (ImageData<BufferedImage>) segment.getImageData();
+
+            try {
+                entry.saveImageData(imageData);
+                logger.info("Saved sub-cluster labels for {} ({} detections)",
+                        entry.getImageName(), segment.getCount());
+            } catch (Exception e) {
+                logger.error("Failed to save image data for {}: {}",
+                        entry.getImageName(), e.getMessage());
+            }
+
+            report(progressCallback, "Saved results for " + entry.getImageName());
+        }
+
+        // Fire hierarchy update for the currently open image, if it was among the
+        // processed images. Null-safe / best-effort: the per-image saves above
+        // already persisted the labels regardless.
+        if (qupath != null) {
+            Platform.runLater(() -> {
+                ImageData<BufferedImage> currentImageData = qupath.getImageData();
+                if (currentImageData != null) {
+                    currentImageData.getHierarchy().fireHierarchyChangedEvent(this);
+                }
+            });
+        }
+
+        String completeMsg = "Project sub-clustering complete: " + result.getNClusters()
+                + " sub-clusters of '" + parentClusterName + "' across " + nImages + " images.";
+        report(progressCallback, completeMsg);
+
+        // Audit trail
+        long elapsed = System.currentTimeMillis() - startTime;
+        Map<String, String> params = OperationLogger.subclusteringParams(
+                parentClusterName, config.getAlgorithm().getDisplayName(), extraction.getNCells());
+        params.put("Images", nImages + " project image" + (nImages == 1 ? "" : "s"));
+        OperationLogger.getInstance().logOperation("PROJECT SUB-CLUSTERING", params, completeMsg, elapsed);
+
+        // Auto-save (project scope) so the sub-cluster result is reloadable via
+        // "View Past Results" and manageable (rename/merge) via "Manage
+        // Clusters" -- same treatment runProjectClustering gives a normal
+        // project-wide run. The scope label calls out that this is a sub-cluster
+        // so it reads distinctly from a normal project run in the dropdown.
+        String scopeLabel = nImages + " project image" + (nImages == 1 ? "" : "s")
+                + " (sub-cluster of '" + parentClusterName + "')";
+        autoSaveResult(result, config, SavedClusteringResult.PROJECT_SCOPE_KEY, scopeLabel);
+
+        return result;
+        } finally {
+            // All groups here are detached copies read via readImageData(); close them.
+            closeGroups(groups);
+        }
     }
 
     /**

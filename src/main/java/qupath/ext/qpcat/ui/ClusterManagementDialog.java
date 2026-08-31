@@ -552,10 +552,12 @@ public class ClusterManagementDialog {
 
     /**
      * Open the Run Clustering dialog in sub-cluster mode for the one selected
-     * cluster. The dialog re-clusters that class's cells on the current image into
-     * sub-types ("&lt;name&gt;.0", ".1", ...). The cells must currently carry the
-     * class -- if this result's names are staged but not applied, "Put this version
-     * on the cells" first, or the sub-cluster run reports that no cells match.
+     * cluster. The dialog re-clusters that class's cells into sub-types
+     * ("&lt;name&gt;.0", ".1", ...), over the current image or a project-wide
+     * scope the dialog's own scope picker offers. The cells must currently carry
+     * the class -- if this result's names are staged but not applied, "Put this
+     * version on the cells" first, or the sub-cluster run reports that no cells
+     * match.
      */
     private void subclusterSelected() {
         List<ClusterRow> selected = new ArrayList<>(clusterListView.getSelectionModel().getSelectedItems());
@@ -565,9 +567,14 @@ public class ClusterManagementDialog {
         }
         String className = selected.get(0).displayName;
         if (className == null || className.isBlank()) return;
-        if (qupath.getImageData() == null) {
+        // A single open image is enough for a current-image run; a project with
+        // images is enough for a project-wide run. Only refuse when NEITHER is
+        // available (mirrors SetupQPCAT's haveImage || haveProject check).
+        boolean haveImage = qupath.getImageData() != null;
+        boolean haveProject = qupath.getProject() != null && !qupath.getProject().getImageList().isEmpty();
+        if (!haveImage && !haveProject) {
             Dialogs.showWarningNotification("QPCAT",
-                    "Open the image whose cells you want to sub-cluster first.");
+                    "Open an image or a project with images to sub-cluster first.");
             return;
         }
         new ClusteringDialog(qupath, className).show();

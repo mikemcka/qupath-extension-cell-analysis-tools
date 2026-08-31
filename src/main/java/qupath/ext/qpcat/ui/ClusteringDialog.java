@@ -233,21 +233,19 @@ public class ClusteringDialog {
                 : "QPCAT - Run Clustering");
         dialog.setHeaderText(subcluster
                 ? "Re-cluster cells classified as '" + subclusterParentClass
-                        + "' on the current image"
+                        + "' into sub-labels -- choose scope below"
                 : "Configure clustering parameters");
         dialog.setResizable(true);
 
-        // Scope: a normal run exposes the image-scope picker; a sub-cluster run is
-        // fixed to the current image's cells of the parent class, so we show a
-        // read-only note instead. createScopeSection() is still called so the
-        // scopeSection field is populated (buildConfig reads it) -- it just is not
-        // added to the layout in sub-cluster mode.
+        // Scope: sub-cluster mode uses the same real scope picker as a normal
+        // run (Current image / All project images / Specific images...) -- it
+        // just re-clusters only the parent class's cells within whatever scope
+        // is chosen, instead of every cell.
         Node scopeNode = createScopeSection();
         if (subcluster) {
-            Label scopeNote = new Label("Scope: cells classified as '"
-                    + subclusterParentClass + "' in the current image");
-            scopeNote.setWrapText(true);
-            scopeNode = scopeNote;
+            scopeSection.setScopeTooltip("Cells classified as '" + subclusterParentClass
+                    + "' in each selected image will be pooled and re-clustered into '"
+                    + subclusterParentClass + ".N' sub-labels.");
         }
 
         // Settings live in their own box so the whole group can be disabled
@@ -1911,11 +1909,10 @@ public class ClusteringDialog {
 
         // Scope -- both the "all" and "specific images" options use the
         // multi-image (project) clustering path; runClustering() picks which
-        // entries to pass. A sub-cluster run is always single-image (the parent
-        // class's cells on the current image), regardless of the hidden scope
-        // section's state.
-        config.setClusterEntireProject(
-                subclusterParentClass == null && !scopeSection.isCurrentImage());
+        // entries to pass. Sub-cluster runs read the same picker: "Current
+        // image" stays single-image (runSubclustering), the other two go
+        // through the project-wide path (runProjectSubclustering).
+        config.setClusterEntireProject(!scopeSection.isCurrentImage());
 
         // Analysis options
         config.setGeneratePlots(generatePlotsCheck.isSelected());
@@ -2336,6 +2333,38 @@ public class ClusteringDialog {
     private boolean confirmClassificationOverwrite(
             List<ProjectImageEntry<BufferedImage>> subsetEntries) {
         boolean projectScope = scopeSection.isAllImages() || subsetEntries != null;
+
+        if (subclusterParentClass != null) {
+            // Sub-clustering only touches cells already classified as the parent
+            // class, never every classification, so this names that class
+            // instead of the generic "ALL classifications will be replaced"
+            // wording the normal-run branches below use.
+            if (projectScope) {
+                int n = subsetEntries != null ? subsetEntries.size()
+                        : (qupath.getProject() != null ? qupath.getProject().getImageList().size() : 0);
+                return Dialogs.showConfirmDialog("QPCAT - sub-cluster?",
+                        "Cells classified as '" + subclusterParentClass + "' across up to " + n
+                        + " project image(s) will be re-clustered into '" + subclusterParentClass
+                        + ".0', '" + subclusterParentClass + ".1', etc. Images with no such cells "
+                        + "are skipped; results are saved back to each processed image. Continue?");
+            }
+            var imageData = qupath.getImageData();
+            if (imageData == null) {
+                return true;
+            }
+            long matching = imageData.getHierarchy().getDetectionObjects().stream()
+                    .filter(d -> d.getPathClass() != null
+                            && d.getPathClass().toString().equals(subclusterParentClass))
+                    .count();
+            if (matching == 0) {
+                return true;
+            }
+            return Dialogs.showConfirmDialog("QPCAT - sub-cluster?",
+                    matching + " cell(s) classified as '" + subclusterParentClass
+                    + "' will be re-clustered into '" + subclusterParentClass + ".0', '"
+                    + subclusterParentClass + ".1', etc. Continue?");
+        }
+
         if (projectScope) {
             int n = subsetEntries != null ? subsetEntries.size()
                     : (qupath.getProject() != null ? qupath.getProject().getImageList().size() : 0);
@@ -2385,7 +2414,7 @@ public class ClusteringDialog {
         // Resolve the image set for the "Specific images..." scope up front so
         // we can validate before kicking off the background run.
         final List<ProjectImageEntry<BufferedImage>> subsetEntries;
-        if (subclusterParentClass == null && scopeSection.isSpecificImages()) {
+        if (scopeSection.isSpecificImages()) {
             if (scopeSection.isSpecificButEmpty()) {
                 Dialogs.showWarningNotification("QPCAT",
                         "No images chosen. Click \"Choose images...\" to pick a subset.");
@@ -2460,11 +2489,39 @@ public class ClusteringDialog {
                 // "3D View" tab reads exactly those images (no picker). null == the
                 // single current image (the 3D pane falls back to the current image).
                 final List<ProjectImageEntry<BufferedImage>> clusteredScope;
+                // Sub-cluster completion messaging only: how many images the
+                // requested scope covered (not necessarily how many had matching
+                // cells) and whether that scope was project-wide (in which case
+                // runProjectSubclustering already saved each image, unlike the
+                // single-image path which relabels the open ImageData only).
+                int subclusterScopeImages = 1;
+                boolean subclusterProjectWide = false;
 
-                if (subclusterParentClass != null) {
+                if (subclusterParentClass != null && config.isClusterEntireProject()) {
+                    // Project-wide sub-cluster: pool the parent class's cells
+                    // across every selected image, re-cluster once, and relabel
+                    // + save each image's matching cells in place. Auto-saves a
+                    // result and opens the full results dialog, same as a normal
+                    // runProjectClustering run -- clusteredScope is the requested
+                    // entries list (mirrors the normal project-clustering branch
+                    // below), so the "3D View" tab reads exactly that scope.
+                    Project<BufferedImage> project = qupath.getProject();
+                    if (project == null) {
+                        throw new Exception("No project is open.");
+                    }
+                    List<ProjectImageEntry<BufferedImage>> entries =
+                            (subsetEntries != null) ? subsetEntries : project.getImageList();
+                    subclusterScopeImages = entries.size();
+                    subclusterProjectWide = true;
+                    clusteredScope = entries;
+                    result = workflow.runProjectSubclustering(
+                            subclusterParentClass, entries, config, progress);
+                } else if (subclusterParentClass != null) {
                     // Sub-cluster mode: re-cluster only the parent class's cells on
                     // the current image and apply hierarchical "<parent>.N" labels.
-                    // Relabels in place -- no project scope, no auto-saved result.
+                    // Relabels in place (no project scope); auto-saves a result and
+                    // opens the results dialog on the current image, same as a
+                    // normal single-image runClustering run.
                     clusteredScope = null;
                     result = workflow.runSubclustering(
                             subclusterParentClass, config, progress);
@@ -2486,6 +2543,8 @@ public class ClusteringDialog {
                 }
 
                 final ClusteringResult finalResult = result;
+                final int finalSubclusterScopeImages = subclusterScopeImages;
+                final boolean finalSubclusterProjectWide = subclusterProjectWide;
                 Platform.runLater(() -> {
                     progressBar.setProgress(1.0);
                     phasePane.complete();
@@ -2493,27 +2552,47 @@ public class ClusteringDialog {
                     activeWorkflow = null;
 
                     if (subclusterParentClass != null) {
+                        String scopeNote = finalSubclusterProjectWide
+                                ? " across up to " + finalSubclusterScopeImages + " project image(s)"
+                                : "";
+                        // Project-wide sub-clustering already saved each processed
+                        // image (mirrors runProjectClustering); the single-image
+                        // path only relabels the open ImageData, so that one still
+                        // needs an explicit project save to persist the classes on
+                        // the objects themselves (independent of the auto-saved
+                        // clustering RESULT below, which is written regardless).
+                        String persistNote = finalSubclusterProjectWide
+                                ? "Results were saved to each processed image."
+                                : "Save the project to persist the new classes.";
+                        // The sub-cluster result is now auto-saved (same as a normal
+                        // run), so it can be renamed/merged via "Manage Clusters" --
+                        // call that out since it used to not exist for sub-clusters.
+                        String savedNote = finalResult.getSavedName() != null
+                                ? " Saved as '" + finalResult.getSavedName()
+                                    + "' -- rename/merge via \"Manage Clusters\"."
+                                : "";
                         statusLabel.setText("Complete: " + finalResult.getNClusters()
-                                + " sub-clusters of '" + subclusterParentClass + "'");
+                                + " sub-clusters of '" + subclusterParentClass + "'" + scopeNote);
                         Dialogs.showInfoNotification("QPCAT",
                                 "Sub-clustering complete: " + finalResult.getNClusters()
-                                + " sub-clusters of '" + subclusterParentClass + "' (labels '"
-                                + subclusterParentClass + ".0', '" + subclusterParentClass
-                                + ".1', ...). Save the project to persist the new classes.");
-                        // Sub-cluster cells are relabelled in place; there is no
-                        // auto-saved result to open in the results window (MVP).
-                        return;
+                                + " sub-clusters of '" + subclusterParentClass + "'" + scopeNote
+                                + " (labels '" + subclusterParentClass + ".0', '"
+                                + subclusterParentClass + ".1', ...). " + persistNote + savedNote);
+                    } else {
+                        statusLabel.setText("Complete: " + finalResult.getNClusters()
+                                + " clusters, " + finalResult.getNCells() + " cells");
+                        Dialogs.showInfoNotification("QPCAT",
+                                "Clustering complete: " + finalResult.getNClusters() + " clusters found.");
                     }
-
-                    statusLabel.setText("Complete: " + finalResult.getNClusters()
-                            + " clusters, " + finalResult.getNCells() + " cells");
-                    Dialogs.showInfoNotification("QPCAT",
-                            "Clustering complete: " + finalResult.getNClusters() + " clusters found.");
 
                     // Always open the results interface so the run is
                     // inspectable -- even a bare clustering (no plots / spatial
                     // stats) now opens, since the result was auto-saved and is
-                    // reloadable via "View Past Results".
+                    // reloadable via "View Past Results". Sub-cluster runs get the
+                    // same treatment as a normal run (heatmap, embedding scatter,
+                    // plots, composition tabs, "3D View") since they go through the
+                    // same executeClusteringTask / Appose pipeline and now populate
+                    // the same cellRefs / cluster-name fields a normal run does.
                     showResultsDialog(finalResult, clusteredScope);
                 });
             } catch (Exception e) {

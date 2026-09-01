@@ -4,6 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.qpcat.model.CellRef;
 import qupath.lib.display.ChannelDisplayInfo;
+import qupath.lib.display.DirectServerChannelInfo;
 import qupath.lib.display.ImageDisplay;
 import qupath.lib.gui.QuPathGUI;
 import qupath.lib.images.ImageData;
@@ -13,6 +14,8 @@ import qupath.lib.projects.ProjectImageEntry;
 import qupath.lib.regions.RegionRequest;
 
 import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -64,6 +67,24 @@ public class CellCropService implements AutoCloseable {
      * @return the crop, or {@code null} if no server could be resolved / read failed
      */
     public BufferedImage readCrop(CellRef ref, double cropScale) {
+        return readCrop(ref, cropScale, null);
+    }
+
+    /**
+     * As {@link #readCrop(CellRef, double)} but rendering only {@code channelNames}
+     * instead of whatever the viewer currently displays.
+     *
+     * <p>Used by the representative-cell gallery to show each cluster in ITS OWN
+     * top-ranked channels. Passing null keeps the viewer's selection, which is
+     * what every other caller wants -- a hover preview should look like the
+     * image on screen.
+     *
+     * <p>Names are matched against the display's channel names case-insensitively.
+     * Any name that matches nothing is skipped; if NOTHING matches, the viewer
+     * selection is used rather than rendering a black crop, because a silently
+     * blank montage reads as "no cells here" rather than "no channel matched".
+     */
+    public BufferedImage readCrop(CellRef ref, double cropScale, List<String> channelNames) {
         if (ref == null) return null;
         ImageServer<BufferedImage> server = resolveServer(ref);
         if (server == null) {
@@ -77,7 +98,7 @@ public class CellCropService implements AutoCloseable {
         try {
             RegionRequest request = RegionRequest.createInstance(
                     server.getPath(), w.downsample, w.x, w.y, w.side, w.side);
-            return applyDisplay(ref, server, server.readRegion(request));
+            return applyDisplay(ref, server, server.readRegion(request), channelNames);
         } catch (Exception e) {
             logger.warn("Crop read failed at ({}, {}) side={} ds={}: {}",
                     w.x, w.y, w.side, w.downsample, e.getMessage());
@@ -133,7 +154,7 @@ public class CellCropService implements AutoCloseable {
      * is available or the transform fails.
      */
     private BufferedImage applyDisplay(CellRef ref, ImageServer<BufferedImage> server,
-                                       BufferedImage raw) {
+                                       BufferedImage raw, List<String> channelNames) {
         if (raw == null) {
             return null;
         }
@@ -142,12 +163,66 @@ public class CellCropService implements AutoCloseable {
             return raw;
         }
         try {
+            List<ChannelDisplayInfo> channels = selectChannels(display, channelNames);
             return ImageDisplay.applyTransforms(raw, null,
-                    display.selectedChannels(), display.displayMode().getValue());
+                    channels, display.displayMode().getValue());
         } catch (Exception e) {
             logger.warn("Display transform failed; using raw crop: {}", e.getMessage());
             return raw;
         }
+    }
+
+    /**
+     * The display channels named by {@code channelNames}, or the viewer's own
+     * selection when that is null/empty or nothing matches.
+     */
+    private static List<ChannelDisplayInfo> selectChannels(ImageDisplay display,
+                                                           List<String> channelNames) {
+        if (channelNames == null || channelNames.isEmpty()) {
+            return display.selectedChannels();
+        }
+        List<ChannelDisplayInfo> out = new ArrayList<>();
+        for (String want : channelNames) {
+            if (want == null || want.isBlank()) continue;
+            for (ChannelDisplayInfo info : display.availableChannels()) {
+                if (matchesChannel(info, want)) {
+                    if (!out.contains(info)) out.add(info);
+                    break;
+                }
+            }
+        }
+        // Nothing matched -> fall back rather than render an all-black crop.
+        return out.isEmpty() ? display.selectedChannels() : out;
+    }
+
+    /**
+     * Does this display channel correspond to the image channel named {@code want}?
+     *
+     * <p>Match {@code getOriginalChannelName()} FIRST. {@code getName()} decorates
+     * the channel name with its index -- {@code DirectServerChannelInfo} returns
+     * "3_SYTOX (C3)" where the server metadata says "3_SYTOX" -- so comparing
+     * against getName() never matches, selectChannels() finds nothing, and the
+     * crop silently falls back to the viewer's channels. That is exactly the bug
+     * where ticking "Use per-cluster channels" appeared to do nothing at all.
+     *
+     * <p>getOriginalChannelName() is declared on DirectServerChannelInfo, not on
+     * the ChannelDisplayInfo interface, hence the instanceof. getName() is still
+     * tried as a fallback for channel types that are not server-backed.
+     */
+    private static boolean matchesChannel(ChannelDisplayInfo info, String want) {
+        if (info instanceof DirectServerChannelInfo direct) {
+            String original = direct.getOriginalChannelName();
+            if (original != null && want.equalsIgnoreCase(original)) {
+                return true;
+            }
+        }
+        String name = info.getName();
+        if (name == null) return false;
+        if (want.equalsIgnoreCase(name)) return true;
+        // "3_SYTOX (C3)" -> "3_SYTOX", for any implementation that decorates the
+        // same way without exposing the undecorated name.
+        int paren = name.lastIndexOf(" (C");
+        return paren > 0 && want.equalsIgnoreCase(name.substring(0, paren));
     }
 
     private ImageDisplay resolveDisplay(CellRef ref, ImageServer<BufferedImage> server) {

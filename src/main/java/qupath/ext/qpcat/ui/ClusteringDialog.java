@@ -2,6 +2,8 @@ package qupath.ext.qpcat.ui;
 
 import static qupath.ext.qpcat.ui.UiLabels.tipLabel;
 
+import javafx.animation.KeyFrame;
+import javafx.animation.Timeline;
 import javafx.application.Platform;
 import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.SimpleBooleanProperty;
@@ -15,6 +17,7 @@ import javafx.scene.control.*;
 import javafx.scene.layout.*;
 import javafx.stage.Modality;
 import javafx.stage.Stage;
+import javafx.util.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.ext.qpcat.controller.ClusteringWorkflow;
@@ -1504,15 +1507,37 @@ public class ClusteringDialog {
         // the same box but under their own heading, and a BLOCK also disables
         // Run so the user cannot start something that must fail.
         List<ScalingLimits.Finding> scaling = checkScaling();
-        boolean blocked = ScalingLimits.isBlocked(scaling);
+        boolean scalingBlocked = ScalingLimits.isBlocked(scaling);
 
-        if (warns.isEmpty() && scaling.isEmpty()) {
+        // A missing runtime capability is a third class of problem again: the
+        // configuration is not slow and not poorly chosen, it simply cannot
+        // start. Same treatment as a scale block -- red, Run disabled -- and
+        // caught here rather than at launch, so the user finds out while
+        // choosing the algorithm instead of after configuring a whole run.
+        // Only assert this once the service is up: before that the flag is
+        // false because nothing has been probed yet, not because banksy is
+        // broken, and blocking on that would be a fabricated failure.
+        String capabilityBlock = null;
+        ApposeClusteringService svc = ApposeClusteringService.getInstance();
+        if (algo == Algorithm.BANKSY && svc.isAvailable() && !svc.isBanksyAvailable()) {
+            capabilityBlock = "BANKSY is selected, but pybanksy could not be imported in "
+                    + "this Python environment, so this run cannot start. Choose another "
+                    + "algorithm, or run Utilities > Rebuild Clustering Environment -- the "
+                    + "Python log records why the import failed.";
+        }
+        boolean blocked = scalingBlocked || capabilityBlock != null;
+
+        if (warns.isEmpty() && scaling.isEmpty() && capabilityBlock == null) {
             preflightLabel.setVisible(false);
             preflightLabel.setManaged(false);
         } else {
             StringBuilder sb = new StringBuilder();
+            if (capabilityBlock != null) {
+                sb.append(capabilityBlock);
+                if (!scaling.isEmpty() || !warns.isEmpty()) sb.append("\n\n");
+            }
             if (!scaling.isEmpty()) {
-                sb.append(blocked
+                sb.append(scalingBlocked
                         ? "This will not run at this size:"
                         : "This will be slow at this size:");
                 for (var f : scaling) sb.append("\n- ").append(f.describe());
@@ -2508,6 +2533,15 @@ public class ClusteringDialog {
      * thread; shows a modal dialog on the FX thread and blocks for the choice.
      */
     private ClusteringWorkflow.SpatialDecision askSpatialEstimate(Double estimateSeconds) {
+        // Don't interrupt a run to report a short wait. Below the threshold the
+        // prompt is pure friction: the user reads "42 seconds" and clicks Run.
+        if (estimateSeconds == null || estimateSeconds.isNaN()
+                || estimateSeconds < SPATIAL_PROMPT_MIN_SECONDS) {
+            logger.info("Spatial statistics estimated at {} -- running without prompting.",
+                    formatDuration(estimateSeconds));
+            return ClusteringWorkflow.SpatialDecision.CONTINUE;
+        }
+
         java.util.concurrent.CompletableFuture<ClusteringWorkflow.SpatialDecision> fut =
                 new java.util.concurrent.CompletableFuture<>();
         Platform.runLater(() -> {
@@ -2516,19 +2550,49 @@ public class ClusteringDialog {
                 alert.initOwner(owner);
                 alert.setTitle("Spatial statistics");
                 alert.setHeaderText("Spatial statistics can be slow on large datasets");
-                alert.setContentText(
+                String body =
                         "Estimated time for the spatial statistics on this dataset: "
                         + formatDuration(estimateSeconds) + ".\n\n"
                         + "These permutation-based statistics scale poorly to very large cell "
                         + "counts. You can run them, skip them (clustering still completes), or "
                         + "cancel the whole run.\n\n"
                         + "You can also press Cancel at any time while it runs -- no measurements "
-                        + "are written unless the run finishes.");
+                        + "are written unless the run finishes.\n\n";
+                alert.setContentText(body + countdownLine(SPATIAL_PROMPT_TIMEOUT_SECONDS));
+
                 ButtonType run = new ButtonType("Run spatial stats", ButtonBar.ButtonData.OK_DONE);
                 ButtonType skip = new ButtonType("Skip spatial stats", ButtonBar.ButtonData.OTHER);
                 ButtonType cancel = new ButtonType("Cancel run", ButtonBar.ButtonData.CANCEL_CLOSE);
                 alert.getButtonTypes().setAll(run, skip, cancel);
+
+                // Proceed by default. Blocking forever on an unattended run is the
+                // worst outcome available here: this prompt fires BEFORE any
+                // clustering is submitted, so a run left waiting computes nothing
+                // and saves nothing. Someone who walks away wanted the run to
+                // happen; the cost of continuing is time, and Cancel stays live
+                // for the whole run.
+                final int[] remaining = {SPATIAL_PROMPT_TIMEOUT_SECONDS};
+                Timeline ticker = new Timeline(new KeyFrame(Duration.seconds(1), ev -> {
+                    remaining[0]--;
+                    if (remaining[0] > 0) {
+                        alert.setContentText(body + countdownLine(remaining[0]));
+                        return;
+                    }
+                    logger.info("Spatial-statistics prompt timed out after {}s with no "
+                            + "answer -- continuing with spatial statistics.",
+                            SPATIAL_PROMPT_TIMEOUT_SECONDS);
+                    fut.complete(ClusteringWorkflow.SpatialDecision.CONTINUE);
+                    alert.setResult(run);      // dismiss without re-completing
+                    alert.close();
+                }));
+                ticker.setCycleCount(SPATIAL_PROMPT_TIMEOUT_SECONDS);
+                ticker.play();
+
                 var choice = alert.showAndWait();
+                ticker.stop();
+                if (fut.isDone()) {
+                    return;                    // the timeout already decided
+                }
                 if (choice.isPresent() && choice.get() == run) {
                     fut.complete(ClusteringWorkflow.SpatialDecision.CONTINUE);
                 } else if (choice.isPresent() && choice.get() == skip) {
@@ -2545,6 +2609,17 @@ public class ClusteringDialog {
         } catch (Exception e) {
             return ClusteringWorkflow.SpatialDecision.CANCEL;
         }
+    }
+
+    /** Below this estimate the prompt is not worth interrupting the run for. */
+    private static final int SPATIAL_PROMPT_MIN_SECONDS = 120;
+
+    /** How long the prompt waits before proceeding on its own. */
+    private static final int SPATIAL_PROMPT_TIMEOUT_SECONDS = 60;
+
+    private static String countdownLine(int seconds) {
+        return "No answer needed: spatial statistics will start on their own in "
+                + seconds + "s, so leaving this open will not stall the run.";
     }
 
     /** Human-readable duration for the estimate prompt. */

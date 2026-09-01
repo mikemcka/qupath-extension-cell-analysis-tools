@@ -25,6 +25,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); QP-
   changes cluster labels. The checkbox state is saved into the run config; **reloading a
   config saved before this release enables the precursor by default -- untick it to
   reproduce the original clusters exactly.**
+- **Sub-cluster a single cluster ("cluster within a cluster").** The Manage Clusters
+  dialog gains a **Sub-cluster...** button (enabled when exactly one cluster is
+  selected). It opens the Run Clustering dialog scoped to that class's cells on the
+  current image -- pick any algorithm, marker subset, normalization, and embedding as
+  usual -- and on Run re-clusters just those cells, assigning
+  hierarchical `<name>.0`, `<name>.1`, ... sub-type classes. This wires up the existing
+  `runSubclustering` backend, which was implemented but unreachable (the docs already
+  pointed here). The run is recorded in the operation audit log.
+  - **Limitations (this release):** operates on the **current image** only, and
+    **relabels in place** -- the sub-run is not saved as its own result in "View Past
+    Results" (the cells carry the new classes; save the project to persist them). The
+    target class must actually be **on the cells** -- if a reloaded saved result's names
+    are staged but not applied, use "Put this version on the cells" first.
 
 ### Fixed
 

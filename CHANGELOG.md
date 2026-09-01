@@ -6,6 +6,155 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); QP-
 
 ## [Unreleased]
 
+## [0.11.2] -- 2026-08-30 -- read each cluster in the channels that define it
+
+### Fixed
+
+- **"Use per-cluster channels" had no effect on the images.**
+  `DirectServerChannelInfo.getName()` appends the channel index -- it returns
+  `3_SYTOX (C3)` where the server metadata says `3_SYTOX` -- so the channel match never
+  succeeded, and the crops silently fell back to the viewer's channels. The fallback
+  ("nothing matched, so use the viewer rather than render black") turned a hard failure
+  into a no-op, which is why the control looked wired up and did nothing. Matches on
+  `getOriginalChannelName()` now.
+- **The "Channels:" count was greyed out and changing it redrew nothing.** It was gated on
+  the legend checkbox rather than on per-cluster channels.
+- **Greyed-out channel controls explained nothing, and could not recover.** Both causes now
+  say which applies and what to do, and the channel list is re-read on every rebuild --
+  opening an image *after* the results window previously left every channel control dead
+  until the window was closed and reopened.
+
+### Changed
+
+- **"Show channels from Marker Rankings" is gone**, and the feature is renamed **"Show each
+  cluster's top channels"**. The old checkbox only moved the legend, which read as a broken
+  image control; the legend is not optional when each cluster is drawn in different
+  channels, because it is the only way to read them.
+- **A `(none)` fixed-channel option**, so a cluster can be drawn in its ranked markers
+  alone. It is also the default when no nuclear-looking channel is present, instead of an
+  empty combo.
+- **Nuclear-channel defaults widened** to DAPI, Hoechst, SYTOX, DRAQ5, TO-PRO, PI, Nucleus,
+  Nuclear and DNA, matched as substrings -- the previous list missed real panel names like
+  `3_SYTOX`.
+- **The spatial-statistics estimate prompt no longer stalls an unattended run.** It fires
+  before any clustering is submitted and blocked indefinitely, so a run left waiting
+  computed nothing and saved nothing. It now counts down 60 s and **proceeds** on timeout
+  (never cancels -- someone who walks away wanted the run to happen), and does not appear
+  at all when the estimate is under two minutes. Cancel stays available throughout.
+
+### Removed
+
+- **`timm` and `huggingface-hub` are out of the bundled Python environment.** They existed
+  only for foundation-model feature extraction, deleted in the previous release entry, so
+  every user was installing two packages for code that is gone.
+
+### Changed
+
+- **Three dependency pins tightened, because regenerating the lock exposed that they were
+  too loose to be safe.** A routine regeneration -- whose only intent was dropping the two
+  packages above -- resolved **squidpy BACKWARDS from 1.6.6 to 1.5.0**. `spatial_stats.py`
+  reads Ripley's L from `uns[...]["L_stat"]`, which is the 1.6.6 shape; on older squidpy that
+  read returns an EMPTY payload while logging success, which is exactly the bug fixed in
+  0.9.x. The floor is now `>=1.6.6`. The same regeneration moved **anthropic 0.107 -> 1.2**,
+  a major bump the LLM explainer has never been tested against; held at `<1`, to be lifted
+  deliberately with a test rather than as a side effect. **pybanksy** is now `>=1.3.4,<1.4`
+  as a standing TODO had specified for the next regeneration: `run_clustering.py` drives its
+  low-level API, which is not stable across minor releases.
+- Remaining environment drift from the same regeneration, none of it requested but all of it
+  forward: pytorch 2.11 -> 2.13, torchvision 0.26 -> 0.28, numba 0.65 -> 0.67, matplotlib
+  3.10 -> 3.11, pandas/pillow/python patch bumps, pybanksy 1.3.4 -> 1.3.5. squidpy, scanpy,
+  anndata, numpy, requests and setuptools (still capped below 81) are unchanged. **The
+  pybanksy contract tests cannot verify 1.3.5 here** -- they need the Appose env and skip
+  without it -- so BANKSY is owed a rig smoke test before release.
+
+### Added
+
+- **Representative cells can be rendered in each cluster's own marker channels**
+  ([#16](https://github.com/uw-loci/qupath-extension-cell-analysis-tools/issues/16)). Crops
+  previously used whatever channels the viewer happened to be showing, which in a highly
+  multiplexed panel is rarely the ones that define a cluster -- and the existing "Show channels
+  from Marker Rankings" legend could therefore NAME channels the crop was not actually drawn in.
+  **Use per-cluster channels** renders each cluster in its own top-ranked marker channels plus a
+  **Fixed channel** shown everywhere (normally the nuclear stain; defaults to the first channel
+  matching DAPI / Hoechst / Nucleus). The fixed channel does not consume one of the "Channels:"
+  slots. Because this makes the montages non-comparable, the panel carries an all-caps warning
+  while it is on and **Save montages** writes a `WARNING.txt` beside the PNGs, citing the
+  community checklists for publishing images (Schmied et al., Nat Methods 21, 170-181, 2024).
+  The gallery's control bar became a wrapping FlowPane in the process: it wants 1,479 px and the
+  results window opens at 850, so as an HBox the checkbox labels would have ellipsized.
+
+### Removed
+
+- **Foundation-model feature extraction is deleted, not just unwired.** The
+  "Extract Foundation Model Features..." command (embeddings from pathology vision models
+  stored as `FM_*` measurements, for clustering cells by appearance rather than marker
+  expression) was taken off the menu in v0.7.0 and has now been removed outright:
+  `FeatureExtractionDialog`, `runFeatureExtraction`, `readTilesAroundCentroids`,
+  `extract_features.py`, the `FOUNDATION_MODELS` registry, and the two `qpcat.fm.*`
+  preferences. The decisive reason is not disuse -- it is that **the Java half was never
+  run end to end by anyone**, as `HOW_TO_GUIDE` section 8 already recorded. It was an
+  unvalidated path, not a working feature set aside, so section 8 no longer offers it for
+  revival. The autoencoder is unaffected: it has its own tile preferences and its own
+  `torch` use, and `detect_device()` stays in `model_utils.py`.
+
+### Fixed
+
+- **Python bytecode caches were shipping inside the jar.** Running the Python test suite
+  leaves a `__pycache__` beside the shipped scripts, and `processResources` packaged it:
+  19 `.pyc` files in every release jar, including bytecode for scripts that had since been
+  deleted. The directory is gitignored, so this was invisible in a diff and visible only
+  in the jar. Now excluded.
+
+- **Two QP-CAT analyses run at once could silently corrupt each other's plots.**
+  Appose runs one Python thread per task inside ONE interpreter and the service is a
+  singleton, so starting a second workflow from another dialog executed it concurrently
+  in the same process. Four of the shipped scripts (`run_clustering`,
+  `cellular_neighborhoods`, `spatial_stats`, `regenerate_plots`) drive matplotlib through
+  pyplot's GLOBAL current-figure state and three of them call `plt.close("all")` -- so a
+  concurrent run closed the other's figures, or wrote the other's figure under its own
+  filename. No error was raised, which means the first sign of it was a plot that did not
+  match its result. Task execution is now serialized on a fair, reentrant lock, with a log
+  line when a run has to queue so the wait is not mistaken for a hang. Serializing rather
+  than locking pyplot specifically also covers any other shared-global hazard in these
+  scripts, not only the one we found.
+- **Shared-memory (`/dev/shm`) leaks when applying autoencoder results.** Every Appose
+  `NDArray` owns a shared-memory segment that must be closed. Two were never closed on any
+  path -- the hybrid-mode training measurement buffer (`nCells * nMeasurements * 8` bytes,
+  leaked on every successful run) and the post-hoc neighbourhood-enrichment matrix -- and
+  nine more were closed only on the success path, so they leaked whenever a run was already
+  failing. All 28 close sites are now covered by `finally` or try-with-resources. The
+  clustering path was already correct; this was confined to the autoencoder and post-hoc
+  spatial paths.
+- **A broken pybanksy passed startup verification and only failed when you picked BANKSY.**
+  `init_services.py` imported banksy as a hard requirement, but the Java-side verification
+  task never probed it, so an environment whose pybanksy was unusable still verified as
+  healthy. Worse, because that import sat ahead of the harmonypy probe in the same `try`,
+  a banksy failure also left `HARMONYPY_AVAILABLE` false -- reporting Harmony as missing
+  when the real casualty was banksy -- and took the whole init into an `init_error` that
+  nothing on the Java side reads. banksy is now probed like harmonypy, through the four
+  entry points the call sites actually import (including `banksy_utils.umap_pca`, which
+  ships as a separate distribution and a top-level `import banksy` would never touch). The
+  result is exported as a capability flag, logged at init, and surfaced in the Clustering
+  dialog: choosing BANKSY without a usable pybanksy now blocks Run with an explanation
+  instead of failing mid-run.
+- **Tile extraction for the autoencoder could overflow its own array length.**
+  `readTilesAroundCentroids` sized its buffer with all-int arithmetic
+  (`nCells * tileSize * tileSize * 3`), which wraps at 14,267 cells for the default 224 px
+  tile -- allocating a short array and then indexing it with a negative offset. The path is
+  currently unreachable (the dialog has been unwired since v0.7.0), so this is a trap
+  removed rather than a bug observed; it now fails with the same explicit `long` guard and
+  actionable message its sibling `readMultiChannelTilesAroundCentroids` already used.
+
+### Changed
+
+- **Corrected the `--frozen` comments in `ApposeClusteringService`.** Three places claimed
+  the environment is built with `--frozen`. It is not, and deliberately so: Appose injects
+  builder flags as global pixi args (`pixi --frozen install ...`), which pixi rejects. The
+  reproducibility guarantee is real but comes from a different mechanism -- staging the
+  bundled manifest together with the lock generated from it, leaving pixi nothing to
+  re-resolve -- which the comments now describe, including the condition that keeps it
+  true.
+
 ## [0.11.0] -- 2026-08-22 -- trustworthy results for TMA cores and subregions
 
 ### Fixed

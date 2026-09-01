@@ -2549,72 +2549,6 @@ public class ClusteringWorkflow {
     // ==================== Shared Tile Reading ====================
 
     /**
-     * Reads RGB tile images centered on each detection's centroid and packs them
-     * into a flat byte array suitable for transfer to Python via Appose NDArray.
-     * <p>
-     * The output array has shape (nDetections, tileSize, tileSize, 3) in row-major order,
-     * with each pixel stored as R, G, B bytes. Out-of-bounds regions are zero-filled.
-     *
-     * @param server           the image server to read tiles from
-     * @param detections       detection objects whose centroids define tile centers
-     * @param tileSize         side length of each square tile in pixels
-     * @param progressCallback optional progress callback (may be null)
-     * @return packed RGB byte array of all tiles
-     */
-    private byte[] readTilesAroundCentroids(
-            ImageServer<BufferedImage> server,
-            List<PathObject> detections,
-            int tileSize,
-            Consumer<String> progressCallback) {
-
-        int nCells = detections.size();
-        int halfTile = tileSize / 2;
-        byte[] tileData = new byte[nCells * tileSize * tileSize * 3];
-
-        forEachTile(nCells, progressCallback, i -> {
-            PathObject det = detections.get(i);
-            double cx = det.getROI().getCentroidX();
-            double cy = det.getROI().getCentroidY();
-
-            int x = Math.max(0, (int) cx - halfTile);
-            int y = Math.max(0, (int) cy - halfTile);
-
-            // Clamp to image bounds
-            x = Math.min(x, Math.max(0, server.getWidth() - tileSize));
-            y = Math.min(y, Math.max(0, server.getHeight() - tileSize));
-
-            int readW = Math.min(tileSize, server.getWidth() - x);
-            int readH = Math.min(tileSize, server.getHeight() - y);
-
-            try {
-                RegionRequest request = RegionRequest.createInstance(
-                        server.getPath(), 1.0, x, y, readW, readH);
-                BufferedImage tile = server.readRegion(request);
-
-                int offset = i * tileSize * tileSize * 3;
-                for (int ty = 0; ty < tileSize; ty++) {
-                    for (int tx = 0; tx < tileSize; tx++) {
-                        if (tx < tile.getWidth() && ty < tile.getHeight()) {
-                            int rgb = tile.getRGB(tx, ty);
-                            tileData[offset++] = (byte) ((rgb >> 16) & 0xFF);
-                            tileData[offset++] = (byte) ((rgb >> 8) & 0xFF);
-                            tileData[offset++] = (byte) (rgb & 0xFF);
-                        } else {
-                            tileData[offset++] = 0;
-                            tileData[offset++] = 0;
-                            tileData[offset++] = 0;
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                logger.warn("Failed to read tile for detection {}: {}", i, e.getMessage());
-            }
-        });
-
-        return tileData;
-    }
-
-    /**
      * Reads multi-channel tile images centered on each detection's centroid.
      * Returns float32 data packed as (nDetections, totalChannels, tileSize, tileSize)
      * in row-major (C-order) layout, suitable for PyTorch conv layers (NCHW).
@@ -2780,122 +2714,6 @@ public class ClusteringWorkflow {
     }
 
     // ==================== Feature Extraction (Foundation Models) ====================
-
-    /**
-     * Extracts foundation model features from tile images around each cell centroid.
-     * Features are stored as measurements (FM_0, FM_1, ...) on each detection.
-     * <p>
-     * Integration approach inspired by LazySlide (MIT License).
-     * Zheng, Y. et al. Nature Methods (2026).
-     * <a href="https://doi.org/10.1038/s41592-026-03044-7">doi:10.1038/s41592-026-03044-7</a>
-     *
-     * @param modelName        foundation model identifier
-     * @param tileSize         tile size in pixels around each centroid
-     * @param batchSize        inference batch size
-     * @param hfToken          HuggingFace auth token (may be null)
-     * @param progressCallback optional progress callback
-     * @return embedding dimensionality
-     * @throws IOException if extraction fails
-     */
-    public int runFeatureExtraction(String modelName, int tileSize, int batchSize,
-                                     String hfToken,
-                                     Consumer<String> progressCallback) throws IOException {
-
-        long startTime = System.currentTimeMillis();
-        report(progressCallback, "Preparing tile images...");
-
-        ImageData<BufferedImage> imageData = qupath.getImageData();
-        if (imageData == null) throw new IOException("No image is open");
-
-        ImageServer<BufferedImage> server = imageData.getServer();
-        List<PathObject> detections = new ArrayList<>(
-                imageData.getHierarchy().getDetectionObjects());
-
-        if (detections.isEmpty())
-            throw new IOException("No detections found. Run cell detection first.");
-
-        int nCells = detections.size();
-
-        report(progressCallback, "Reading " + nCells + " tile images (" + tileSize + "x" + tileSize + ")...");
-        byte[] tileData = readTilesAroundCentroids(server, detections, tileSize, progressCallback);
-
-        report(progressCallback, "Sending tiles to Python for feature extraction...");
-
-        // Create NDArray for tile data
-        int embedDim;
-        try {
-            embedDim = ApposeClusteringService.withExtensionClassLoader(() -> {
-                NDArray.Shape shape = new NDArray.Shape(
-                        NDArray.Shape.Order.C_ORDER, nCells, tileSize, tileSize, 3);
-                NDArray tilesNd = new NDArray(NDArray.DType.INT8, shape);
-                tilesNd.buffer().put(tileData);
-
-                Map<String, Object> inputs = new HashMap<>();
-                inputs.put("tile_images", tilesNd);
-                inputs.put("model_name", modelName);
-                inputs.put("batch_size", batchSize);
-                if (hfToken != null) {
-                    inputs.put("hf_token", hfToken);
-                }
-
-                ApposeClusteringService service = ApposeClusteringService.getInstance();
-                Task task = service.runTaskWithListener("extract_features", inputs, event -> {
-                    if (event.responseType == ResponseType.UPDATE && event.message != null) {
-                        report(progressCallback, event.message);
-                    }
-                });
-
-                // Parse results
-                NDArray featuresNd = (NDArray) task.outputs.get("features");
-                int dim = ((Number) task.outputs.get("embed_dim")).intValue();
-
-                // Read features into array
-                float[] featuresBuf = new float[nCells * dim];
-                featuresNd.buffer().asFloatBuffer().get(featuresBuf);
-
-                // Apply features as measurements on detections
-                report(progressCallback, "Applying " + dim + "-d features as measurements...");
-                for (int i = 0; i < nCells; i++) {
-                    PathObject det = detections.get(i);
-                    var ml = det.getMeasurementList();
-                    for (int d = 0; d < dim; d++) {
-                        ml.put("FM_" + d, featuresBuf[i * dim + d]);
-                    }
-                }
-
-                // Cleanup
-                closeQuietly(tilesNd, "tilesNd");
-                closeQuietly(featuresNd, "featuresNd");
-
-                return dim;
-            });
-        } catch (IOException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new IOException("Feature extraction failed: " + e.getMessage(), e);
-        }
-
-        // Fire hierarchy update
-        Platform.runLater(() -> {
-            ImageData<BufferedImage> currentImageData = qupath.getImageData();
-            if (currentImageData != null) {
-                currentImageData.getHierarchy().fireHierarchyChangedEvent(this);
-            }
-        });
-
-        long elapsed = System.currentTimeMillis() - startTime;
-        String msg = "Feature extraction: " + embedDim + "-dim from " + modelName
-                + " for " + nCells + " cells";
-        report(progressCallback, msg);
-        OperationLogger.getInstance().logOperation("FEATURE_EXTRACTION",
-                Map.of("Model", modelName,
-                       "TileSize", String.valueOf(tileSize),
-                       "EmbedDim", String.valueOf(embedDim),
-                       "Cells", String.valueOf(nCells)),
-                msg, elapsed);
-
-        return embedDim;
-    }
 
     // ==================== Autoencoder Training & Inference ====================
 
@@ -3259,129 +3077,140 @@ public class ClusteringWorkflow {
         final int finalNChannels = nChannels;
         try {
             ApposeClusteringService.withExtensionClassLoader(() -> {
-                Map<String, Object> inputs = new HashMap<>();
-                inputs.put("input_mode", inputMode);
-                inputs.put("labels", classLabels.length > 0
-                        ? toIntList(classLabels) : List.of());
-                inputs.put("label_names", classNames);
-                inputs.put("latent_dim", latentDim);
-                inputs.put("n_epochs", epochs);
-                inputs.put("learning_rate", learningRate);
-                inputs.put("batch_size", batchSize);
-                inputs.put("supervision_weight", supervisionWeight);
-                inputs.put("normalization", normalization);
-                inputs.put("validation_split", validationSplit);
-                inputs.put("early_stopping_patience", earlyStoppingPatience);
-                inputs.put("enable_class_weights", enableClassWeights);
-                if (manualClassWeights != null && !manualClassWeights.isEmpty()) {
-                    inputs.put("manual_weight_names",
-                            new ArrayList<>(manualClassWeights.keySet()));
-                    inputs.put("manual_weight_values",
-                            new ArrayList<>(manualClassWeights.values()));
-                }
-                inputs.put("enable_augmentation", enableAugmentation);
+                // Every NDArray here owns a /dev/shm segment. They used to be
+                // closed on the success path only -- and the two INPUT arrays
+                // were never closed at all, so a hybrid-mode run leaked
+                // nCells * nMeasurements * 8 bytes every time it succeeded.
+                // Same drain-list idiom as readSpatialGraphPayload below.
+                List<NDArray> shm = new ArrayList<>();
+                try {
+                    Map<String, Object> inputs = new HashMap<>();
+                    inputs.put("input_mode", inputMode);
+                    inputs.put("labels", classLabels.length > 0
+                            ? toIntList(classLabels) : List.of());
+                    inputs.put("label_names", classNames);
+                    inputs.put("latent_dim", latentDim);
+                    inputs.put("n_epochs", epochs);
+                    inputs.put("learning_rate", learningRate);
+                    inputs.put("batch_size", batchSize);
+                    inputs.put("supervision_weight", supervisionWeight);
+                    inputs.put("normalization", normalization);
+                    inputs.put("validation_split", validationSplit);
+                    inputs.put("early_stopping_patience", earlyStoppingPatience);
+                    inputs.put("enable_class_weights", enableClassWeights);
+                    if (manualClassWeights != null && !manualClassWeights.isEmpty()) {
+                        inputs.put("manual_weight_names",
+                                new ArrayList<>(manualClassWeights.keySet()));
+                        inputs.put("manual_weight_values",
+                                new ArrayList<>(manualClassWeights.values()));
+                    }
+                    inputs.put("enable_augmentation", enableAugmentation);
 
-                // Advanced VAE parameters from Preferences
-                inputs.put("kl_beta_max", QpcatPreferences.getAeKlBetaMax());
-                inputs.put("kl_cycles", QpcatPreferences.getAeKlCycles());
-                inputs.put("kl_ramp_fraction", QpcatPreferences.getAeKlRampFraction());
-                inputs.put("free_bits", QpcatPreferences.getAeFreeBits());
-                inputs.put("pretrain_fraction", QpcatPreferences.getAePretrainFraction());
-                // Measurement-mode augmentation
-                inputs.put("aug_noise_std", QpcatPreferences.getAeAugNoise());
-                inputs.put("aug_scale_range", QpcatPreferences.getAeAugScale());
-                inputs.put("aug_dropout_p", QpcatPreferences.getAeAugDropout());
-                // Tile-mode augmentation
-                inputs.put("aug_flip_h", QpcatPreferences.isAeAugFlipH());
-                inputs.put("aug_flip_v", QpcatPreferences.isAeAugFlipV());
-                inputs.put("aug_rotation_90", QpcatPreferences.isAeAugRotation90());
-                inputs.put("aug_elastic", QpcatPreferences.isAeAugElastic());
-                inputs.put("aug_elastic_alpha", QpcatPreferences.getAeAugElasticAlpha());
-                inputs.put("aug_intensity_mode", QpcatPreferences.getAeAugIntensityMode());
-                inputs.put("aug_intensity_amount", QpcatPreferences.getAeAugIntensityAmount());
-                inputs.put("aug_gauss_noise", QpcatPreferences.getAeAugGaussNoise());
+                    // Advanced VAE parameters from Preferences
+                    inputs.put("kl_beta_max", QpcatPreferences.getAeKlBetaMax());
+                    inputs.put("kl_cycles", QpcatPreferences.getAeKlCycles());
+                    inputs.put("kl_ramp_fraction", QpcatPreferences.getAeKlRampFraction());
+                    inputs.put("free_bits", QpcatPreferences.getAeFreeBits());
+                    inputs.put("pretrain_fraction", QpcatPreferences.getAePretrainFraction());
+                    // Measurement-mode augmentation
+                    inputs.put("aug_noise_std", QpcatPreferences.getAeAugNoise());
+                    inputs.put("aug_scale_range", QpcatPreferences.getAeAugScale());
+                    inputs.put("aug_dropout_p", QpcatPreferences.getAeAugDropout());
+                    // Tile-mode augmentation
+                    inputs.put("aug_flip_h", QpcatPreferences.isAeAugFlipH());
+                    inputs.put("aug_flip_v", QpcatPreferences.isAeAugFlipV());
+                    inputs.put("aug_rotation_90", QpcatPreferences.isAeAugRotation90());
+                    inputs.put("aug_elastic", QpcatPreferences.isAeAugElastic());
+                    inputs.put("aug_elastic_alpha", QpcatPreferences.getAeAugElasticAlpha());
+                    inputs.put("aug_intensity_mode", QpcatPreferences.getAeAugIntensityMode());
+                    inputs.put("aug_intensity_amount", QpcatPreferences.getAeAugIntensityAmount());
+                    inputs.put("aug_gauss_noise", QpcatPreferences.getAeAugGaussNoise());
 
-                inputs.put("grad_clip_norm", QpcatPreferences.getAeGradClipNorm());
-                inputs.put("lr_scheduler_factor", QpcatPreferences.getAeLrSchedulerFactor());
-                inputs.put("lr_scheduler_patience", QpcatPreferences.getAeLrSchedulerPatience());
+                    inputs.put("grad_clip_norm", QpcatPreferences.getAeGradClipNorm());
+                    inputs.put("lr_scheduler_factor", QpcatPreferences.getAeLrSchedulerFactor());
+                    inputs.put("lr_scheduler_patience", QpcatPreferences.getAeLrSchedulerPatience());
 
-                if (!useTiles) {
-                    // Measurement mode
-                    int nMeasurements = finalExtraction.getNMeasurements();
-                    NDArray measurementsNd = buildMeasurementNDArray(
-                            finalExtraction.getData(), nCells, nMeasurements);
-                    inputs.put("measurements", measurementsNd);
-                    inputs.put("marker_names", List.of(finalExtraction.getMeasurementNames()));
-                } else {
-                    // Tile mode: pass file path for Python to memory-map
-                    inputs.put("tile_file_path", finalTileTempFile.toAbsolutePath().toString());
-                    inputs.put("n_cells", nCells);
-                    inputs.put("n_channels", finalNChannels);
-                    inputs.put("tile_size", Math.max(2, (int) Math.round(tileSize / downsample)));
-
-                    // Hybrid mode: also pass measurements alongside tiles
-                    if (finalExtraction != null && finalExtraction.getNMeasurements() > 0) {
+                    if (!useTiles) {
+                        // Measurement mode
                         int nMeasurements = finalExtraction.getNMeasurements();
-                        NDArray.Shape mShape = new NDArray.Shape(
-                                NDArray.Shape.Order.C_ORDER, nCells, nMeasurements);
-                        NDArray tileMeasNd = new NDArray(NDArray.DType.FLOAT64, mShape);
-                        var mBuf = tileMeasNd.buffer().asDoubleBuffer();
-                        for (double[] row : finalExtraction.getData()) mBuf.put(row);
-                        inputs.put("tile_measurements", tileMeasNd);
+                        NDArray measurementsNd = buildMeasurementNDArray(
+                                finalExtraction.getData(), nCells, nMeasurements);
+                        shm.add(measurementsNd);
+                        inputs.put("measurements", measurementsNd);
+                        inputs.put("marker_names", List.of(finalExtraction.getMeasurementNames()));
+                    } else {
+                        // Tile mode: pass file path for Python to memory-map
+                        inputs.put("tile_file_path", finalTileTempFile.toAbsolutePath().toString());
+                        inputs.put("n_cells", nCells);
+                        inputs.put("n_channels", finalNChannels);
+                        inputs.put("tile_size", Math.max(2, (int) Math.round(tileSize / downsample)));
+
+                        // Hybrid mode: also pass measurements alongside tiles
+                        if (finalExtraction != null && finalExtraction.getNMeasurements() > 0) {
+                            int nMeasurements = finalExtraction.getNMeasurements();
+                            NDArray.Shape mShape = new NDArray.Shape(
+                                    NDArray.Shape.Order.C_ORDER, nCells, nMeasurements);
+                            NDArray tileMeasNd = new NDArray(NDArray.DType.FLOAT64, mShape);
+                            shm.add(tileMeasNd);
+                            var mBuf = tileMeasNd.buffer().asDoubleBuffer();
+                            for (double[] row : finalExtraction.getData()) mBuf.put(row);
+                            inputs.put("tile_measurements", tileMeasNd);
+                        }
                     }
-                }
 
-                ApposeClusteringService service = ApposeClusteringService.getInstance();
-                Task task = service.runTaskWithListener("train_autoencoder", inputs, event -> {
-                    if (event.responseType == ResponseType.UPDATE && event.message != null) {
-                        report(progressCallback, event.message);
+                    ApposeClusteringService service = ApposeClusteringService.getInstance();
+                    Task task = service.runTaskWithListener("train_autoencoder", inputs, event -> {
+                        if (event.responseType == ResponseType.UPDATE && event.message != null) {
+                            report(progressCallback, event.message);
+                        }
+                    });
+
+                    // Parse results
+                    NDArray latentNd = (NDArray) task.outputs.get("latent_features");
+                    NDArray predNd = (NDArray) task.outputs.get("predicted_labels");
+                    NDArray confNd = (NDArray) task.outputs.get("prediction_confidence");
+                    shm.add(latentNd);
+                    shm.add(predNd);
+                    shm.add(confNd);
+
+                    float[] latentBuf = new float[nCells * latentDim];
+                    latentNd.buffer().asFloatBuffer().get(latentBuf);
+                    int[] predLabels = new int[nCells];
+                    predNd.buffer().asIntBuffer().get(predLabels);
+                    float[] confidence = new float[nCells];
+                    confNd.buffer().asFloatBuffer().get(confidence);
+
+                    // Apply latent features as measurements
+                    List<PathObject> targetDetections = useTiles
+                            ? allDetections : finalExtraction.getDetections();
+                    for (int i = 0; i < nCells; i++) {
+                        var ml = targetDetections.get(i).getMeasurements();
+                        for (int d = 0; d < latentDim; d++) {
+                            ml.put("AE_" + d, (double) latentBuf[i * latentDim + d]);
+                        }
+                        ml.put("AE_confidence", (double) confidence[i]);
                     }
-                });
 
-                // Parse results
-                NDArray latentNd = (NDArray) task.outputs.get("latent_features");
-                NDArray predNd = (NDArray) task.outputs.get("predicted_labels");
-                NDArray confNd = (NDArray) task.outputs.get("prediction_confidence");
-
-                float[] latentBuf = new float[nCells * latentDim];
-                latentNd.buffer().asFloatBuffer().get(latentBuf);
-                int[] predLabels = new int[nCells];
-                predNd.buffer().asIntBuffer().get(predLabels);
-                float[] confidence = new float[nCells];
-                confNd.buffer().asFloatBuffer().get(confidence);
-
-                // Apply latent features as measurements
-                List<PathObject> targetDetections = useTiles
-                        ? allDetections : finalExtraction.getDetections();
-                for (int i = 0; i < nCells; i++) {
-                    var ml = targetDetections.get(i).getMeasurements();
-                    for (int d = 0; d < latentDim; d++) {
-                        ml.put("AE_" + d, (double) latentBuf[i * latentDim + d]);
+                    // Apply predicted labels
+                    if (!classNames.isEmpty()) {
+                        ResultApplier applier = new ResultApplier();
+                        applier.applyPhenotypeLabels(targetDetections,
+                                predLabels, classNames.toArray(new String[0]));
                     }
-                    ml.put("AE_confidence", (double) confidence[i]);
+
+                    resultMap.put("model_state",
+                            String.valueOf(task.outputs.get("model_state_base64")));
+                    resultMap.put("class_names", classNames.toArray(new String[0]));
+                    resultMap.put("accuracy", task.outputs.get("final_class_accuracy"));
+                    resultMap.put("best_val_accuracy", task.outputs.get("best_val_accuracy"));
+                    resultMap.put("best_epoch", task.outputs.get("best_epoch"));
+                    resultMap.put("n_classes", task.outputs.get("n_classes"));
+                    resultMap.put("active_units", task.outputs.get("active_units"));
+
+                    return null;
+                } finally {
+                    for (NDArray n : shm) closeQuietly(n, "autoencoder-train");
                 }
-
-                // Apply predicted labels
-                if (!classNames.isEmpty()) {
-                    ResultApplier applier = new ResultApplier();
-                    applier.applyPhenotypeLabels(targetDetections,
-                            predLabels, classNames.toArray(new String[0]));
-                }
-
-                resultMap.put("model_state",
-                        String.valueOf(task.outputs.get("model_state_base64")));
-                resultMap.put("class_names", classNames.toArray(new String[0]));
-                resultMap.put("accuracy", task.outputs.get("final_class_accuracy"));
-                resultMap.put("best_val_accuracy", task.outputs.get("best_val_accuracy"));
-                resultMap.put("best_epoch", task.outputs.get("best_epoch"));
-                resultMap.put("n_classes", task.outputs.get("n_classes"));
-                resultMap.put("active_units", task.outputs.get("active_units"));
-
-                closeQuietly(latentNd, "latentNd");
-                closeQuietly(predNd, "predNd");
-                closeQuietly(confNd, "confNd");
-
-                return null;
             });
         } catch (IOException e) {
             throw e;
@@ -3563,32 +3392,44 @@ public class ClusteringWorkflow {
             try {
                 predictions = ApposeClusteringService.withExtensionClassLoader(() -> {
                     Map<String, Object> inputs = new HashMap<>();
-                    inputs.put("model_state_base64", modelStateBase64);
+                    // The INPUT array owns a /dev/shm segment as well. The
+                    // try-with-resources below covers only the OUTPUTS, so without
+                    // this the input leaked on EVERY run, not just failing ones --
+                    // once per image, in a loop over images.
+                    List<NDArray> inputShm = new ArrayList<>();
+                    try {
+                        inputs.put("model_state_base64", modelStateBase64);
 
-                    if (useTiles) {
-                        inputs.put("tile_file_path", fInferTileFile.toAbsolutePath().toString());
-                        inputs.put("n_cells", nCells);
-                        inputs.put("n_channels", fNChannels);
-                        inputs.put("tile_size", Math.max(2, (int) Math.round(tileSize / downsample)));
-                    } else {
-                        int nMeasurements = fExtraction.getNMeasurements();
-                        NDArray.Shape shape = new NDArray.Shape(
-                                NDArray.Shape.Order.C_ORDER, nCells, nMeasurements);
-                        NDArray measurementsNd = new NDArray(NDArray.DType.FLOAT64, shape);
-                        var buf = measurementsNd.buffer().asDoubleBuffer();
-                        for (double[] row : fExtraction.getData()) buf.put(row);
-                        inputs.put("measurements", measurementsNd);
-                        inputs.put("marker_names", List.of(fExtraction.getMeasurementNames()));
+                        if (useTiles) {
+                            inputs.put("tile_file_path", fInferTileFile.toAbsolutePath().toString());
+                            inputs.put("n_cells", nCells);
+                            inputs.put("n_channels", fNChannels);
+                            inputs.put("tile_size", Math.max(2, (int) Math.round(tileSize / downsample)));
+                        } else {
+                            int nMeasurements = fExtraction.getNMeasurements();
+                            NDArray.Shape shape = new NDArray.Shape(
+                                    NDArray.Shape.Order.C_ORDER, nCells, nMeasurements);
+                            NDArray measurementsNd = new NDArray(NDArray.DType.FLOAT64, shape);
+                        inputShm.add(measurementsNd);
+                            var buf = measurementsNd.buffer().asDoubleBuffer();
+                            for (double[] row : fExtraction.getData()) buf.put(row);
+                            inputs.put("measurements", measurementsNd);
+                            inputs.put("marker_names", List.of(fExtraction.getMeasurementNames()));
+                        }
+
+                        ApposeClusteringService service = ApposeClusteringService.getInstance();
+                        Task task = service.runTask("infer_autoencoder", inputs);
+
+                        // try-with-resources: the segment leaked whenever the read
+                        // below threw, which is exactly when a run is already failing.
+                        try (NDArray predNd = (NDArray) task.outputs.get("predicted_labels")) {
+                            int[] preds = new int[nCells];
+                            predNd.buffer().asIntBuffer().get(preds);
+                            return preds;
+                        }
+                    } finally {
+                        for (NDArray n : inputShm) closeQuietly(n, "autoencoder-infer-input");
                     }
-
-                    ApposeClusteringService service = ApposeClusteringService.getInstance();
-                    Task task = service.runTask("infer_autoencoder", inputs);
-
-                    NDArray predNd = (NDArray) task.outputs.get("predicted_labels");
-                    int[] preds = new int[nCells];
-                    predNd.buffer().asIntBuffer().get(preds);
-                    closeQuietly(predNd, "predNd");
-                    return preds;
                 });
             } catch (Exception e) {
                 logger.error("Inference failed for {}: {}", entry.getImageName(), e.getMessage());
@@ -3793,70 +3634,81 @@ public class ClusteringWorkflow {
                 ApposeClusteringService.withExtensionClassLoader(() -> {
                     int nCells = detections.size();
                     Map<String, Object> inputs = new HashMap<>();
-                    inputs.put("model_state_base64", modelStateBase64);
+                    // The INPUT array owns a /dev/shm segment as well. The
+                    // try-with-resources below covers only the OUTPUTS, so without
+                    // this the input leaked on EVERY run, not just failing ones --
+                    // once per image, in a loop over images.
+                    List<NDArray> inputShm = new ArrayList<>();
+                    try {
+                        inputs.put("model_state_base64", modelStateBase64);
 
-                    if (useTiles) {
-                        inputs.put("tile_file_path",
-                                finalInferTileFile.toAbsolutePath().toString());
-                        inputs.put("n_cells", nCells);
-                        inputs.put("n_channels", finalNChannels);
-                        inputs.put("tile_size", Math.max(2, (int) Math.round(tileSize / downsample)));
-                    } else {
-                        int nMeasurements = finalExtraction.getNMeasurements();
-                        NDArray.Shape shape = new NDArray.Shape(
-                                NDArray.Shape.Order.C_ORDER, nCells, nMeasurements);
-                        NDArray measurementsNd = new NDArray(NDArray.DType.FLOAT64, shape);
-                        var buf = measurementsNd.buffer().asDoubleBuffer();
-                        for (double[] row : finalExtraction.getData()) buf.put(row);
-                        inputs.put("measurements", measurementsNd);
-                        inputs.put("marker_names", List.of(finalExtraction.getMeasurementNames()));
-                    }
-
-                    ApposeClusteringService service = ApposeClusteringService.getInstance();
-                    Task task = service.runTaskWithListener("infer_autoencoder", inputs, event -> {
-                        if (event.responseType == ResponseType.UPDATE && event.message != null) {
-                            report(progressCallback, event.message);
+                        if (useTiles) {
+                            inputs.put("tile_file_path",
+                                    finalInferTileFile.toAbsolutePath().toString());
+                            inputs.put("n_cells", nCells);
+                            inputs.put("n_channels", finalNChannels);
+                            inputs.put("tile_size", Math.max(2, (int) Math.round(tileSize / downsample)));
+                        } else {
+                            int nMeasurements = finalExtraction.getNMeasurements();
+                            NDArray.Shape shape = new NDArray.Shape(
+                                    NDArray.Shape.Order.C_ORDER, nCells, nMeasurements);
+                            NDArray measurementsNd = new NDArray(NDArray.DType.FLOAT64, shape);
+                        inputShm.add(measurementsNd);
+                            var buf = measurementsNd.buffer().asDoubleBuffer();
+                            for (double[] row : finalExtraction.getData()) buf.put(row);
+                            inputs.put("measurements", measurementsNd);
+                            inputs.put("marker_names", List.of(finalExtraction.getMeasurementNames()));
                         }
-                    });
 
-                    NDArray latentNd = (NDArray) task.outputs.get("latent_features");
-                    NDArray predNd = (NDArray) task.outputs.get("predicted_labels");
-                    NDArray confNd = (NDArray) task.outputs.get("prediction_confidence");
+                        ApposeClusteringService service = ApposeClusteringService.getInstance();
+                        Task task = service.runTaskWithListener("infer_autoencoder", inputs, event -> {
+                            if (event.responseType == ResponseType.UPDATE && event.message != null) {
+                                report(progressCallback, event.message);
+                            }
+                        });
 
-                    // Infer latent dim from buffer size
-                    int latentBufSize = latentNd.buffer().asFloatBuffer().remaining();
-                    int latentDim = latentBufSize / nCells;
+                        // try-with-resources: these three own /dev/shm segments and
+                        // were closed on the success path only, so any failure between
+                        // here and the end of the block leaked all three -- once per
+                        // image in the loop.
+                        try (NDArray latentNd = (NDArray) task.outputs.get("latent_features");
+                             NDArray predNd = (NDArray) task.outputs.get("predicted_labels");
+                             NDArray confNd = (NDArray) task.outputs.get("prediction_confidence")) {
 
-                    float[] latentBuf = new float[nCells * latentDim];
-                    latentNd.buffer().asFloatBuffer().get(latentBuf);
-                    int[] predLabels = new int[nCells];
-                    predNd.buffer().asIntBuffer().get(predLabels);
-                    float[] confidence = new float[nCells];
-                    confNd.buffer().asFloatBuffer().get(confidence);
+                            // Infer latent dim from buffer size
+                            int latentBufSize = latentNd.buffer().asFloatBuffer().remaining();
+                            int latentDim = latentBufSize / nCells;
 
-                    // Apply to detections
-                    List<PathObject> targetDets = useTiles
-                            ? detections
-                            : finalExtraction.getDetections();
-                    for (int i = 0; i < nCells; i++) {
-                        var ml = targetDets.get(i).getMeasurements();
-                        for (int d = 0; d < latentDim; d++) {
-                            ml.put("AE_" + d, (double) latentBuf[i * latentDim + d]);
+                            float[] latentBuf = new float[nCells * latentDim];
+                            latentNd.buffer().asFloatBuffer().get(latentBuf);
+                            int[] predLabels = new int[nCells];
+                            predNd.buffer().asIntBuffer().get(predLabels);
+                            float[] confidence = new float[nCells];
+                            confNd.buffer().asFloatBuffer().get(confidence);
+
+                            // Apply to detections
+                            List<PathObject> targetDets = useTiles
+                                    ? detections
+                                    : finalExtraction.getDetections();
+                            for (int i = 0; i < nCells; i++) {
+                                var ml = targetDets.get(i).getMeasurements();
+                                for (int d = 0; d < latentDim; d++) {
+                                    ml.put("AE_" + d, (double) latentBuf[i * latentDim + d]);
+                                }
+                                ml.put("AE_confidence", (double) confidence[i]);
+                            }
+
+                            if (classNames != null && classNames.length > 0) {
+                                ResultApplier applier = new ResultApplier();
+                                applier.applyPhenotypeLabels(targetDets,
+                                        predLabels, classNames);
+                            }
+
+                            return null;
                         }
-                        ml.put("AE_confidence", (double) confidence[i]);
+                    } finally {
+                        for (NDArray n : inputShm) closeQuietly(n, "autoencoder-infer-input");
                     }
-
-                    if (classNames != null && classNames.length > 0) {
-                        ResultApplier applier = new ResultApplier();
-                        applier.applyPhenotypeLabels(targetDets,
-                                predLabels, classNames);
-                    }
-
-                    closeQuietly(latentNd, "latentNd");
-                    closeQuietly(predNd, "predNd");
-                    closeQuietly(confNd, "confNd");
-
-                    return null;
                 });
             } catch (Exception e) {
                 logger.error("Failed to apply autoencoder to {}: {}",

@@ -275,6 +275,15 @@ Parameters:
 - **k_geom**: Number of spatial nearest neighbors. The algorithm requests `k_geom * (max_m + 1)` neighbors internally, so with default `max_m=1` the effective k is doubled. QP-CAT automatically caps k_geom to fit each area's cell count.
 - **resolution**: Leiden resolution for the final clustering step
 
+**pybanksy dependency:** BANKSY clustering requires the [pybanksy](https://github.com/prabhakarlab/Banksy_py) Python package. If pybanksy failed to import when the QP-CAT Python environment started, the **Run Clustering** button will be disabled when BANKSY is selected, with an explanation message.
+
+**If BANKSY selection shows an error:**
+
+1. Open the QP-CAT Python log to see why pybanksy failed to import (Extensions > QP-CAT > Setup & help > System Info..., or check the QuPath log).
+2. Look for the line `pybanksy: <version>` or `pybanksy: NOT USABLE` in the startup messages.
+3. **Use Utilities > Rebuild Clustering Environment** to delete and re-create the pixi env from a clean slate. This re-resolves all dependencies and should produce a working pybanksy install.
+4. If rebuild still fails, file a bug report with the full QuPath log attached.
+
 ### Spatial Feature Smoothing
 
 Spatial feature smoothing is a graph convolution pre-step that can be enabled for **any** clustering algorithm. When enabled, each cell's features are smoothed with its spatial neighbors before clustering, encouraging nearby cells to receive similar cluster assignments.
@@ -736,7 +745,6 @@ src/main/java/qupath/ext/qpcat/
     ClusterManagementDialog.java  Rename/merge cluster classifications
     EmbeddingDialog.java          Embedding-only computation dialog
     EmbeddingScatterPanel.java    Interactive 2D embedding scatter plot
-    FeatureExtractionDialog.java  Foundation-model feature extraction dialog (removed/unwired; see HOW_TO_GUIDE "Removed features")
     HistogramPanel.java           Interactive histogram with draggable threshold
     PhenotypingDialog.java        Phenotyping rules and gating dialog
     PythonConsoleWindow.java      Real-time Python stderr viewer
@@ -747,7 +755,6 @@ src/main/resources/qupath/ext/qpcat/
   scripts/
     compute_thresholds.py         Auto-threshold computation
     export_anndata.py             AnnData export
-    extract_features.py           Foundation-model feature extraction (removed/unwired)
     infer_autoencoder.py          Autoencoder inference on new data
     init_services.py              Python worker initialization
     model_utils.py                Model save/load and architecture utilities

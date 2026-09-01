@@ -384,78 +384,28 @@ Automatically compute marker gate thresholds instead of setting them manually.
 ## 8. Removed features
 
 Capabilities that shipped in earlier versions but were removed to keep the tool
-focused. The code generally remains in the repository (just unwired), so any of
-these can be **re-added if there is enough interest** -- open an issue or use
-**Report a Bug** to ask.
+focused. Whether the code is still in the repository varies -- each entry below
+says. Where it has been deleted, treat bringing the capability back as new work
+rather than as re-enabling something that already works. If you want one of
+these, open an issue or use **Report a Bug** to ask.
 
-### Foundation-model feature extraction (removed in v0.7.0)
+### Foundation-model feature extraction (removed in v0.7.0, deleted in 0.11.1)
 
-Earlier versions had **"Add AI appearance features to cells..."** (later
-**"Extract Foundation Model Features..."**), which extracted morphological
-embeddings from pretrained pathology vision foundation models (H-optimus-0,
-Virchow, Hibou-B/L, Midnight, DINOv2-Large) and stored them as per-cell `FM_*`
-measurements; those could then be selected in the clustering dialog like channel
-intensities to cluster cells by appearance rather than marker expression. It was
-removed from the menu in v0.7.0 because it saw little use and added a heavy
-model-download dependency. The backend (`FeatureExtractionDialog`,
-`extract_features.py`) is retained but unwired; the menu command can be
-reinstated on request.
+**"Extract Foundation Model Features..."** extracted morphological embeddings from
+pretrained pathology vision foundation models and stored them as per-cell `FM_*`
+measurements, which could then be selected in the clustering dialog to cluster cells by
+appearance rather than marker expression.
 
-**Test status (checked 2026-08-04).** Be precise about what has and has not been
-run, because "untested" was previously doing too much work here:
+It was unwired from the menu in v0.7.0 and the code has now been deleted. Two reasons, and
+the second is the decisive one: it saw effectively no use and pulled a heavy model-download
+dependency (`timm`, `huggingface-hub`) that every user installed; and **the Java half was
+never run end to end by anyone.** The Python extraction logic had been exercised against a
+single ungated model, but the full path -- QuPath detections to tiles, shared-memory
+transfer, `FM_*` measurements written back onto cells -- was never executed. It is not a
+working feature that was set aside; it is an unvalidated one.
 
-- The **Python side runs.** `extract_features.py` was executed against the shipped
-  `model_utils.py` registry with `dinov2-large` and 12 synthetic 224x224 RGB
-  tiles: it loaded the model through timm, ran inference and returned a
-  `(12, 1024)` float32 array -- all finite, non-degenerate, and matching the
-  embedding dimension the registry declares. So the extraction logic, the
-  batching, the model-output handling and the NDArray packaging all work.
-- **Four of the five models are unverified.** H-optimus-0, Virchow, Hibou-B and
-  Hibou-L are all gated on HuggingFace (their `config.json` returns HTTP 401
-  without an accepted licence and a token), so none of their registry entries has
-  been confirmed loadable. `dinov2-large` is the only ungated entry and the only
-  one anyone has run. Note the script carries an explicit guard for a repo that
-  is a *transformers* model rather than a *timm* one -- which is a failure mode a
-  gated entry could still be sitting in.
-- **The Java side has never been run.** The dialog is unwired from the menu, so
-  the full path -- QuPath detections to tiles, shared-memory transfer, `FM_*`
-  measurements written back onto cells -- has not been exercised end-to-end by
-  anyone. This, not the Python, is the untested part.
-
-If the feature is ever reinstated, treat the Java round trip as unproven and the
-four gated models as unconfirmed.
-
-<details>
-<summary>Full pre-removal documentation (preserved for revival)</summary>
-
-**Extensions > QP-CAT > Extract Foundation Model Features...** extracted
-tile-level morphological embeddings from pre-trained vision foundation models and
-stored them as per-detection measurements (`FM_0`, `FM_1`, ..., `FM_N`).
-
-Supported models:
-
-| Model | Developer | License | Embedding Dim | Gated? |
-|-------|-----------|---------|:---:|:---:|
-| **H-optimus-0** | Bioptimus | Apache 2.0 | 1536 | Yes |
-| **Virchow** | Paige AI | Apache 2.0 | 2560 | Yes |
-| **Hibou-B** | HistAI | Apache 2.0 | 768 | Yes |
-| **Hibou-L** | HistAI | Apache 2.0 | 1024 | Yes |
-| **Midnight** | kaiko.ai | Apache 2.0 | 768 | No |
-| **DINOv2-Large** | Meta AI | Apache 2.0 | 1024 | No |
-
-All models were downloaded on-demand from HuggingFace and cached locally (not
-bundled with the extension); only commercially permissive (Apache 2.0) licenses
-were included. Gated models (H-optimus-0, Virchow, Hibou) required a HuggingFace
-account and auth token: accept the model's license on its HuggingFace page, then
-enter the token in the extraction dialog.
-
-Foundation model features capture rich morphological information from the image
-tile surrounding each cell, usable as input measurements for clustering (instead
-of or alongside channel intensities) for morphology-driven cell grouping. Powered
-by [LazySlide](https://doi.org/10.1038/s41592-026-03044-7). The Python
-dependencies (`timm`, `huggingface-hub`) remain in `pixi.toml`.
-
-</details>
+There is therefore nothing here to reinstate. Anyone wanting appearance-based clustering
+should treat it as new work rather than as a revival.
 
 ---
 
@@ -917,7 +867,7 @@ Log files are plain text and can be opened in any text editor. A new file is cre
 
 Beyond the default neighborhood enrichment + Moran's I, QP-CAT v1 exposes the rest of squidpy's standard spatial-statistics catalog: Ripley's K and L, Geary's C, and co-occurrence (pairwise + one-vs-rest). Each is driven by a single graph constructor you pick once at the top of the dialog; the same graph backs spatial feature smoothing (when the preference is enabled) so the parameters are visible and consistent across the run. QP-CAT's v1 catalog closes the gap with [OpenIMC](https://github.com/dean-tessone/OpenIMC)'s spatial-stats surface while keeping the squidpy backend the extension already ships with -- no new dependencies.
 
-> These statistics use permutation testing and can be slow on large slides (the dialog estimates the time and lets you skip or cancel). For a fast, scalable way to map recurring tissue micro-environments instead, see [chapter 22 -- Finding Cellular Neighborhoods](#22-finding-cellular-neighborhoods-spatial-niches).
+> These statistics use permutation testing and can be slow on large slides. Before clustering is submitted, a dialog estimates the computation time and lets you proceed, skip, or cancel. Estimates under 2 minutes do not show a prompt. For longer estimates, the dialog waits 60 seconds for your choice; if you leave it unattended, it automatically proceeds rather than stalling the run. For a fast, scalable way to map recurring tissue micro-environments instead, see [chapter 22 -- Finding Cellular Neighborhoods](#22-finding-cellular-neighborhoods-spatial-niches).
 
 ### When to use each statistic
 
@@ -1418,7 +1368,25 @@ Per-cluster gallery of image crops of the most typical cells. For each cluster, 
 
 The **Center** dropdown chooses how "center" is defined: *Feature-space medoid* (default; nearest the cluster mean in the normalized measurement space the clustering used) or *Embedding-space medoid* (nearest the cluster's center in the 2D plot). The **Crop x bbox** spinner sets the crop window as a multiple of each cell's bounding box (default 3x), so cells fill a consistent fraction of every thumbnail regardless of magnification.
 
-**Show channels from Marker Rankings** (optional checkbox) appends a small legend to the end of each cluster's row listing the image channels behind that cluster's top-ranked markers, each as a colored swatch (the channel's display color) plus its name. The **Channels** spinner sets how many to show (default 4). Channels are resolved from the [Marker Rankings](#marker-rankings-tab): the top measurements per cluster are matched back to image channels by looking for a channel name inside each measurement name -- this works across detection engines that name measurements differently ("CD8: Cell: Mean", "Cell: CD8 mean", etc.). If you renamed channels or measurements so that nothing matches, the legend simply shows no channels for that cluster rather than erroring. The checkbox is disabled when the result has no Marker Rankings or no image is open. Use the legend to read at a glance which stains dominate each cluster while looking at its crops.
+**Show each cluster's top channels** (optional checkbox) renders each cluster's crops in **that cluster's own top-ranked marker channels** (from [Marker Rankings](#marker-rankings-tab)), plus one **Fixed channel** shown in every cluster -- normally the nuclear stain, so each crop keeps a common anatomical reference. A small legend showing all channels used for each crop is automatically appended to the end of each cluster's row.
+
+The **Channels** spinner sets how many ranked markers to show per cluster (default 4). Channels are matched from the [Marker Rankings](#marker-rankings-tab) by looking for a channel name inside each measurement name -- this works across detection engines that name measurements differently ("CD8: Cell: Mean", "Cell: CD8 mean", etc.). If you renamed channels or measurements so that a marker matches no channel, that marker is simply left out rather than erroring; if nothing matches at all, the crops fall back to the channels the viewer is currently showing.
+
+The **Fixed channel** dropdown defaults to the first channel whose name contains (as substrings) DAPI, Hoechst, SYTOX, DRAQ5, TO-PRO, PI, Nucleus, Nuclear or DNA. You can pick any channel from the dropdown, or **(none)** to add no fixed channel -- each cluster is then drawn in its ranked markers alone. The fixed channel does **not** count towards the **Channels:** number: set that to 3 and you get the fixed channel plus 3 ranked markers, or just those 3 with **(none)** selected -- it does not promote the fixed slot into an extra marker.
+
+The checkbox is disabled when the result has no Marker Rankings or no image is open.
+
+Without this option, crops are rendered with whatever channels the viewer is currently showing, which in a highly multiplexed panel is rarely the handful that define a given cluster.
+
+> **The trade-off is comparability.** Once each cluster is drawn in different channels, the
+> montages **cannot be compared with each other** -- brightness, contrast and colour no longer
+> mean the same thing from one image to the next. They can only be read one at a time, as "what
+> does a typical cell of this cluster look like in the markers that define it". The panel says so
+> while the option is on, and **Save montages** writes a `WARNING.txt` beside the PNGs so the
+> caveat travels with the images into whatever figure they end up in. For the broader practice
+> here, see the community checklists for publishing images: Schmied C, Nelson MS, Avilov S, et
+> al., *Nature Methods* **21**, 170-181 (2024),
+> [doi:10.1038/s41592-023-01987-9](https://doi.org/10.1038/s41592-023-01987-9).
 
 A medoid is a real, observed cell -- not a synthetic prototype or an average image -- and "representative" means typical, not pure. Read these crops alongside the Heatmap and Marker Rankings tabs. See [Best Practices -> Representative Cells](BEST_PRACTICES.md#representative-cells).
 

@@ -38,10 +38,14 @@ public class ApposeClusteringService {
     private static final String RESOURCE_BASE = "qupath/ext/qpcat/";
     private static final String PIXI_TOML_RESOURCE = RESOURCE_BASE + "pixi.toml";
     // Bundled lockfile pinning the FULL transitive dependency tree (all 4
-    // platforms). Installed with --frozen so users get the exact, tested
-    // versions on every update -- no re-resolution against current
-    // conda-forge/PyPI, which is what let setuptools drift to a pkg_resources-
-    // less 81.x. Regenerate via tools/regen-pixi-lock.sh when pixi.toml changes.
+    // platforms). We do NOT pass --frozen (see initialize() for why); instead
+    // syncManifest() stages this lock next to the manifest it was generated
+    // from, so plain `pixi install` finds the lock already up to date and
+    // installs straight from it without re-resolving against current
+    // conda-forge/PyPI -- which is what let setuptools drift to a
+    // pkg_resources-less 81.x. That equivalence holds only while the two files
+    // stay in step: regenerate via tools/regen-pixi-lock.sh whenever pixi.toml
+    // changes, and commit both together.
     private static final String PIXI_LOCK_RESOURCE = RESOURCE_BASE + "pixi.lock";
     private static final String SCRIPTS_BASE = RESOURCE_BASE + "scripts/";
     private static final String ENV_NAME = "qupath-qpcat";
@@ -65,6 +69,44 @@ public class ApposeClusteringService {
 
     private static ApposeClusteringService instance;
 
+    /**
+     * Serializes task execution on the shared Python worker.
+     *
+     * <p>Appose runs one Python thread per task inside ONE interpreter, and this
+     * service is a singleton, so two QP-CAT workflows started from two dialogs
+     * execute concurrently in the same process. That is not safe with the
+     * scripts we ship: run_clustering, cellular_neighborhoods, spatial_stats and
+     * regenerate_plots all drive matplotlib through pyplot's GLOBAL
+     * current-figure state, and three of them call {@code plt.close("all")}. A
+     * concurrent run therefore closes the other's figures, or writes the other's
+     * figure under its own filename -- with no error raised, so the first sign
+     * of it is a plot that does not match its result.
+     *
+     * <p>Serializing is the honest fix: there is one interpreter, so there is one
+     * queue. It also covers any other shared-global hazard in these scripts
+     * rather than only the pyplot one we happened to find. Fair, so a queued
+     * workflow is not starved by a stream of short tasks; reentrant, so a task
+     * that calls back in cannot deadlock itself.
+     *
+     * <p>Deliberately NOT taken by {@code withExtensionClassLoader}, which is a
+     * generic TCCL helper and not a task runner.
+     */
+    private static final java.util.concurrent.locks.ReentrantLock TASK_LOCK =
+            new java.util.concurrent.locks.ReentrantLock(true);
+
+    /**
+     * Takes {@link #TASK_LOCK}, saying so in the log if the caller has to wait.
+     * Without that line a queued run looks like a hang -- the dialog sits on
+     * "Running..." with nothing to explain why.
+     */
+    private static void acquireWorker(String scriptName) {
+        if (TASK_LOCK.tryLock()) return;
+        logger.info("Task '{}' is waiting for the Python worker -- another QP-CAT "
+                + "analysis is running. Tasks run one at a time because they share "
+                + "a single Python interpreter.", scriptName);
+        TASK_LOCK.lock();
+    }
+
     private Environment environment;
     private Service pythonService;
     private boolean initialized;
@@ -76,6 +118,7 @@ public class ApposeClusteringService {
     // Java reads these to gray out features whose Python deps are missing
     // rather than crashing the whole extension. Default false until init.
     private boolean harmonypyAvailable;
+    private boolean banksyAvailable;
 
     private ApposeClusteringService() {}
 
@@ -256,7 +299,7 @@ public class ApposeClusteringService {
 
                 // Import numpy first to avoid Windows threading deadlock
                 // Load model_utils into global scope so task scripts can use
-                // detect_device() and FOUNDATION_MODELS without import
+                // detect_device() and the shared helpers without import
                 String initScript = "import numpy\n"
                         + loadScript("init_services.py") + "\n"
                         + loadScript("model_utils.py");
@@ -317,7 +360,8 @@ public class ApposeClusteringService {
                         "task.outputs['scanpy_version'] = scanpy.__version__\n" +
                         "task.outputs['umap_version'] = umap.__version__\n" +
                         "task.outputs['env_version'] = ENVIRONMENT_VERSION\n" +
-                        "task.outputs['harmonypy_available'] = HARMONYPY_AVAILABLE\n";
+                        "task.outputs['harmonypy_available'] = HARMONYPY_AVAILABLE\n" +
+                        "task.outputs['banksy_available'] = BANKSY_AVAILABLE\n";
 
                 Task verifyTask = pythonService.task(verifyScript);
                 verifyTask.listen(event -> {
@@ -334,9 +378,13 @@ public class ApposeClusteringService {
                 String envVersion = String.valueOf(verifyTask.outputs.get("env_version"));
                 Object harmonypyFlag = verifyTask.outputs.get("harmonypy_available");
                 harmonypyAvailable = Boolean.TRUE.equals(harmonypyFlag);
-                logger.info("Verified: scikit-learn {}, scanpy {}, umap {}, env {} (harmonypy={})",
+                Object banksyFlag = verifyTask.outputs.get("banksy_available");
+                banksyAvailable = Boolean.TRUE.equals(banksyFlag);
+                logger.info("Verified: scikit-learn {}, scanpy {}, umap {}, env {} "
+                        + "(harmonypy={}, pybanksy={})",
                         sklearnVersion, scanpyVersion, umapVersion, envVersion,
-                        harmonypyAvailable ? "available" : "MISSING");
+                        harmonypyAvailable ? "available" : "MISSING",
+                        banksyAvailable ? "available" : "MISSING");
 
                 // Version check: warn if environment version doesn't match expected
                 if (!EXPECTED_ENV_VERSION.equals(envVersion)) {
@@ -468,6 +516,7 @@ public class ApposeClusteringService {
         int maxAttempts = qupath.ext.qpcat.preferences.QpcatPreferences.getTaskMaxRetries();
         ClassLoader original = Thread.currentThread().getContextClassLoader();
         Thread.currentThread().setContextClassLoader(ApposeClusteringService.class.getClassLoader());
+        acquireWorker(scriptName);
         try {
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
@@ -501,6 +550,7 @@ public class ApposeClusteringService {
             Thread.currentThread().interrupt();
             throw new IOException("Task '" + scriptName + "' interrupted", e);
         } finally {
+            TASK_LOCK.unlock();
             Thread.currentThread().setContextClassLoader(original);
         }
     }
@@ -540,6 +590,7 @@ public class ApposeClusteringService {
         int maxAttempts = qupath.ext.qpcat.preferences.QpcatPreferences.getTaskMaxRetries();
         ClassLoader original = Thread.currentThread().getContextClassLoader();
         Thread.currentThread().setContextClassLoader(ApposeClusteringService.class.getClassLoader());
+        acquireWorker(scriptName);
         try {
             for (int attempt = 1; attempt <= maxAttempts; attempt++) {
                 try {
@@ -570,6 +621,7 @@ public class ApposeClusteringService {
             Thread.currentThread().interrupt();
             throw new IOException("Task '" + scriptName + "' interrupted", e);
         } finally {
+            TASK_LOCK.unlock();
             Thread.currentThread().setContextClassLoader(original);
         }
     }
@@ -668,6 +720,19 @@ public class ApposeClusteringService {
      */
     public boolean isHarmonypyAvailable() {
         return initialized && harmonypyAvailable;
+    }
+
+    /**
+     * Whether pybanksy imported cleanly in the worker, so BANKSY clustering can
+     * actually run.
+     *
+     * <p>Probed at init like harmonypy. Before this existed the verification
+     * script did not mention banksy at all, so an environment with a broken
+     * pybanksy verified as healthy and the user only discovered it after
+     * configuring and launching a BANKSY run.
+     */
+    public boolean isBanksyAvailable() {
+        return initialized && banksyAvailable;
     }
 
     /**
@@ -804,13 +869,20 @@ public class ApposeClusteringService {
 
     /**
      * Sync the on-disk pixi.toml AND pixi.lock with the JAR-bundled versions.
-     * The lock is the source of truth for the installed versions (we build with
-     * --frozen), so it must be staged into the env dir before the build:
+     *
+     * <p>The lock is the source of truth for the installed versions, and this
+     * method is what makes that true. We cannot pass {@code --frozen} to force
+     * it (Appose injects builder flags as global pixi args, which pixi rejects
+     * -- see initialize()), so we get the same effect by construction: stage
+     * the bundled manifest and the lock generated FROM that manifest together,
+     * leaving pixi nothing to re-resolve. Both files must be written before the
+     * build, and they must come from the same bundle -- staging a manifest
+     * without its matching lock is what would silently re-enable resolution.
      *
      * <ul>
      *   <li>First run (no manifest on disk): create the env dir and stage the
-     *       lock so the very first --frozen install has it. Appose writes the
-     *       manifest itself.</li>
+     *       lock so the very first install already has it. Appose writes the
+     *       manifest itself, from the same bundled content.</li>
      *   <li>Either file changed vs the bundle: rewrite both and delete .pixi/
      *       so pixi reinstalls cleanly from the new lock.</li>
      *   <li>Unchanged: ensure the lock is present (re-stage if a prior wipe
@@ -907,7 +979,8 @@ public class ApposeClusteringService {
             String exLock = expectedLock.replace("\r\n", "\n").strip();
 
             if (onToml.equals(exToml) && onLock.equals(exLock)) {
-                // Unchanged -- but make sure the lock is on disk for --frozen.
+                // Unchanged -- but make sure the lock is on disk, so the
+                // install has something to install FROM rather than resolving.
                 if (!Files.exists(lockFile)) {
                     Files.writeString(lockFile, expectedLock, StandardCharsets.UTF_8);
                 }
